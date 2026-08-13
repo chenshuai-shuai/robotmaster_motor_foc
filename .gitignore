@@ -1,0 +1,28 @@
+# Keil MDK-ARM 编译产物
+fw_rtos_base/MDK-ARM/*.log
+fw_rtos_base/MDK-ARM/F427IIH6_CAN/
+fw_rtos_base/MDK-ARM/Objects/
+fw_rtos_base/MDK-ARM/Listings/
+fw_rtos_base/MDK-ARM/DebugConfig/
+fw_rtos_base/MDK-ARM/RTE/
+fw_rtos_base/MDK-ARM/*.uvguix*
+fw_rtos_base/MDK-ARM/*.bak
+fw_rtos_base/MDK-ARM/*.dep
+fw_rtos_base/MDK-ARM/*.crf
+fw_rtos_base/MDK-ARM/*.d
+fw_rtos_base/MDK-ARM/*.o
+fw_rtos_base/MDK-ARM/*.axf
+fw_rtos_base/MDK-ARM/*.hex
+fw_rtos_base/MDK-ARM/*.htm
+fw_rtos_base/MDK-ARM/*.build_log.htm
+fw_rtos_base/MDK-ARM/*.iex
+fw_rtos_base/MDK-ARM/*.plg
+fw_rtos_base/MDK-ARM/*.scvd
+fw_rtos_base/MDK-ARM/.vscode/
+
+# VSCode
+.vscode/
+
+# 系统文件
+Thumbs.db
+Desktop.ini
