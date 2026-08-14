@@ -26,3 +26,18 @@ fw_rtos_base/MDK-ARM/.vscode/
 # 系统文件
 Thumbs.db
 Desktop.ini
+# VSCode 运行日志
+.vscode/*.log
+.vscode/*.lock
+# 清理备份区
+_stray_backup_*/
+# 根目录防护（防 CubeMX 再生成到根目录）
+/Inc/
+/Src/
+/RTE/
+/DebugConfig/
+/*.uvprojx
+/*.uvoptx
+/*.uvguix*
+/*.scvd
+/startup_stm32f427xx.s
