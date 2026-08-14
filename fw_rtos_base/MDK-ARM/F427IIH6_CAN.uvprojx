@@ -136,18 +136,6 @@
             <UpdateFlashBeforeDebugging>1</UpdateFlashBeforeDebugging>
             <Capability>1</Capability>
             <DriverSelection>4101</DriverSelection>
-            <FlashDownload>
-              <Files>
-                <File>
-                  <Name>STM32F4xx 2048KB Flash</Name>
-                  <Start>0x8000000</Start>
-                  <Size>0x200000</Size>
-                  <Driver>STM32F4xx_2048.FLM</Driver>
-                  <Path>E:\keil_arm\AppData\Local\Keil_v5\PACK\Keil\STM32F4xx_DFP\3.1.1\CMSIS\Flash\STM32F4xx_2048.FLM</Path>
-                  <Option>1</Option>
-                </File>
-              </Files>
-            </FlashDownload>
           </Flash1>
           <bUseTDR>1</bUseTDR>
           <Flash2>BIN\UL2V8M.DLL</Flash2>
