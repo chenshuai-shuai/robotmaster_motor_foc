@@ -72,3 +72,28 @@ IDLE(2s) → RAMP_UP(电流0→0.8A, 5s) → HOLD(0.5A, 3s) → RAMP_DOWN(→0, 
 2. 速度闭环（PID 速度环，pid.c 已有，可参考知识库 zhangpanyang 例程）
 3. 4 电机注册（C610_Group_Register 组0=0x200 管 ID1-4，四台都接）
 4. 麦轮运动学（4 轮转速 = f(前进/横移/旋转)）→ 全向移动
+
+## USB CDC 日志口（2026-08-16 新增）
+
+板载 USB 口（J14：DP=PA12/DM=PA11/ID=PA10，22Ω 串联 + ESD，VBUS 无检测脚）已配置为 **USB CDC 虚拟串口**：
+- 一根 USB 线直连电脑，Win10+ 免驱，设备管理器出现 `USB 串行设备 (COMx)`
+- 日志仍走 printf → 串口（USART6 PG9/PG14）与 USB 并存，后续可把日志切到 CDC
+- 主频 **168MHz**（原 180，给 USB 48MHz 让路）；CAN 波特率已重算保持 1Mbps
+
+## CubeMX 生成后必跑修复脚本 ⚠️
+
+CubeMX（本机实际版本 6.18.1，目录名 stm32cubemx6.8.0 是旧的）每次 GENERATE CODE 会破坏 4 处，
+生成后必须执行：
+
+```
+cd fw_rtos_base && python fix_after_mx.py
+```
+
+脚本自动修复：FreeRTOS GCC port（AC6 必需）、uvprojx 引用、main.c 的 USB 初始化与停用项。
+已知 CubeMX 6.18 打开 6.14 格式 .ioc 会丢 CAN1 配置（PD0/PD1），生成后务必检查 can.c 里 hcan1 是否存在。
+
+## 烧录环境（2026-08-14 修复记录）
+
+- Keil MDK 精简版：`E:\keil_arm\AppData\Local\Keil_v5\UV4`（缺 STLink DLL/DFP pack，已手动补全）
+- Flash 算法：Keil GUI 配 `STM32F4xx 2MB Flash` 后 **Ctrl+S 保存**（被 CubeMX 覆盖时需重配）
+- 烧录失败先查：Keil GUI 是否开着（占 ST-Link）→ USB 线是否是数据线 → ST-LINK_CLI 连接测试
