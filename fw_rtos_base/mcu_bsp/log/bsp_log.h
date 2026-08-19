@@ -26,11 +26,10 @@
 #define BSP_LOG_LEVEL   LOG_LEVEL_DEBUG  /* 当前级别：发布/比赛固件建议 LOG_LEVEL_WARN */
 
 /* ---- 日志通道参数（集中配置） ---- */
-/* 发送环形缓冲：上电起全量缓存，USB 枚举成功后统一补发（USB 是唯一日志口）。
- * 4KB 足以容纳完整启动日志 + 枚举前数秒运行日志；缓冲满时丢弃新日志保头部。 */
+/* UART 唯一日志口（USART6，经 uart10 实例中断发送）：环形缓冲平滑日志洪峰，
+ * 缓冲满时丢弃新日志保头部（启动日志优先）。 */
 #define LOG_BUF_SIZE         4096U   /* 发送环形缓冲总字节数（2 的幂） */
-#define LOG_USB_CHUNK_SIZE   64U     /* USB FS IN 端点单包上限 */
-#define LOG_RX_BUF_SIZE      256U    /* USB 接收环形缓冲字节数（2 的幂） */
+#define LOG_UART_CHUNK_SIZE  128U    /* UART 中断发送单段上限 */
 #define LOG_TASK_PRIORITY    1U      /* 发送任务优先级：最低，让出 CPU */
 #define LOG_TASK_STACK_WORDS 192U    /* 发送任务栈深度（字） */
 #define LOG_FMT_BUF_SIZE     128U    /* 单条日志栈上格式化缓冲，超长截断 */
@@ -79,19 +78,5 @@ void bsp_log_init(void);
 
 /* 发送缓冲满时丢弃的日志条数（调试观测用） */
 uint32_t bsp_log_get_drop_count(void);
-
-/* 非阻塞读取 USB 接收环形缓冲：返回实际读出字节数，读出后即从缓冲移除 */
-uint32_t bsp_log_rx_read(uint8_t *out, uint32_t maxlen);
-
-/* ---- USB CDC 回调接入接口（仅 usbd_cdc_if.c 的 USER CODE 区调用） ---- */
-
-/* CDC_Init_FS/CDC_DeInit_FS 维护 USB 枚举状态：置位后日志任务切 USB 通道，清零回落 UART */
-void bsp_log_set_usb_connected(uint8_t connected);
-
-/* CDC_TransmitCplt_FS（USB 中断上下文）调用：唤醒日志任务发送下一包 */
-void bsp_log_notify_tx_cplt_from_isr(void);
-
-/* CDC_Receive_FS（USB 中断上下文）调用：把主机发来的数据推入接收环形缓冲 */
-void bsp_log_rx_push(const uint8_t *data, uint32_t len);
 
 #endif

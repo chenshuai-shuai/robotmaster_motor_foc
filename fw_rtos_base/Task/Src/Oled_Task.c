@@ -28,7 +28,7 @@ static void oled_task(void *arg)
 {
     (void)arg;
 
-    LOG_I("OledTask", "启动：首帧绘制 HelloWorld / OLED Test OK");
+    LOG_I("OledTask", "start: first frame HelloWorld / OLED Test OK");
 
     /* 首帧静态画面（一次绘制，后续仅刷新秒数行） */
     OLED_Clear();

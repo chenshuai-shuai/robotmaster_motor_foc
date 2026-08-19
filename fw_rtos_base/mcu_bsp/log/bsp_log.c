@@ -8,38 +8,30 @@
  */
 #include "bsp_log.h"
 #include <stdarg.h>
-
 /* USER CODE BEGIN  */
+#include "bsp_usart.h"
 #include "usart.h"
-#include "../../USB_DEVICE/App/usbd_cdc_if.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
 
-extern USBD_HandleTypeDef hUsbDeviceFS;
+extern USARTInstance uart10;
 
 /* USER CODE END  */
-
 
 /* ---- 内部状态 ----
  * 发送环形缓冲：生产者 debug_transmit（任务上下文），消费者日志任务。
  * 索引为 uint32 配合"容量-1"掩码回绕（缓冲容量为 2 的幂，见 bsp_log.h 参数区）。
  * 所有共享变量用 volatile + 临界区保护。 */
 
-/* 发送通道（USB CDC 唯一日志口：枚举前日志全量缓存，枚举后统一补发） */
+/* 发送通道（UART 主输出，USART6） */
 static uint8_t s_log_tx_buf[LOG_BUF_SIZE];
 static volatile uint32_t s_log_tx_wr = 0U;       /* 生产者写索引（临界区保护） */
 static volatile uint32_t s_log_tx_rd = 0U;       /* 消费者读索引（仅日志任务修改） */
 static volatile uint32_t s_log_tx_drop_cnt = 0U; /* 缓冲满时丢弃的整条日志数 */
 
-/* 接收通道（USB CDC 下行数据，应用层经 bsp_log_rx_read 消费） */
-static uint8_t s_log_rx_buf[LOG_RX_BUF_SIZE];
-static volatile uint32_t s_log_rx_head = 0U;     /* 生产者写索引（USB 中断上下文） */
-static volatile uint32_t s_log_rx_tail = 0U;     /* 消费者读索引（应用层任务） */
-
-static TaskHandle_t s_log_task_handle = NULL;    /* 日志任务句柄（发送完成回调从 ISR 通知它） */
+static TaskHandle_t s_log_task_handle = NULL;    /* 日志任务句柄 */
 static volatile uint8_t s_log_task_created = 0U; /* 任务创建标志（防重复创建） */
-static volatile uint8_t s_usb_connected = 0U;    /* USB 枚举完成标志（CDC_Init_FS 置位） */
 
 static const char s_level_char[5U] = { ' ', 'E', 'W', 'I', 'D' }; /* 级别前缀字符 */
 
@@ -216,129 +208,6 @@ void debug_transmit(uint8_t *data, uint16_t len)
 
 
 /**
- * @brief USB 发送完成回调入口（USB 中断上下文）
- *
- * usbd_cdc_if.c 的 CDC_TransmitCplt_FS（USER CODE 区）调用本函数唤醒日志任务，
- * 让它继续从缓冲取下一包发送；避免 usbd_cdc_if.c 直接依赖 FreeRTOS API。
- */
-void bsp_log_notify_tx_cplt_from_isr(void)
-{
-    if (s_log_task_handle != NULL)
-    {
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        vTaskNotifyGiveFromISR(s_log_task_handle, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-    }
-}
-
-
-/**
- * @brief 维护 USB 枚举状态
- *
- * usbd_cdc_if.c 在 CDC_Init_FS 置位（主机 SET_CONFIGURATION 后）、
- * CDC_DeInit_FS 清零（USB 复位/断开）。日志任务据此选择 USB 或 UART 通道。
- * 本函数可能被中断上下文调用，内部使用上下文自适应临界区。
- *
- * @param connected 非 0 表示 USB 已枚举
- */
-void bsp_log_set_usb_connected(uint8_t connected)
-{
-    UBaseType_t saved = log_enter_critical();
-    uint8_t was_connected = s_usb_connected;
-    s_usb_connected = (connected != 0U) ? 1U : 0U;
-    log_exit_critical(saved);
-
-    /* 0→1 跳变：USB 刚枚举成功，唤醒日志任务打印通道切换提示。
-     * 本函数运行在 USB 中断上下文，使用 FROM_ISR 通知 + 让出；
-     * 提示日志本身由任务上下文打印（ISR 内不直接格式化/发送）。 */
-    if ((was_connected == 0U) && (s_usb_connected != 0U) &&
-        (s_log_task_handle != NULL))
-    {
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-        vTaskNotifyGiveFromISR(s_log_task_handle, &xHigherPriorityTaskWoken);
-        portYIELD_FROM_ISR(xHigherPriorityTaskWoken);
-    }
-}
-
-
-/**
- * @brief USB 下行数据入队（USB 中断上下文）
- *
- * usbd_cdc_if.c 的 CDC_Receive_FS 调用：把主机发来的数据整段推入接收环形缓冲。
- * 缓冲满时丢弃本次数据（应用层消费速度低于接收速度时的保护），不 echo、不转发。
- *
- * @param data 数据指针
- * @param len  字节数
- */
-void bsp_log_rx_push(const uint8_t *data, uint32_t len)
-{
-    if ((data == NULL) || (len == 0U))
-    {
-        return;
-    }
-
-    UBaseType_t saved = log_enter_critical();
-    uint32_t avail = (s_log_rx_head - s_log_rx_tail) & (LOG_RX_BUF_SIZE - 1U);
-    uint32_t free = LOG_RX_BUF_SIZE - 1U - avail;
-    if (len <= free)
-    {
-        uint32_t cont = LOG_RX_BUF_SIZE - s_log_rx_head;
-        if (len <= cont)
-        {
-            memcpy(&s_log_rx_buf[s_log_rx_head], data, len);
-        }
-        else
-        {
-            memcpy(&s_log_rx_buf[s_log_rx_head], data, cont);
-            memcpy(&s_log_rx_buf[0], data + cont, len - cont);
-        }
-        s_log_rx_head = (s_log_rx_head + len) & (LOG_RX_BUF_SIZE - 1U);
-    }
-    log_exit_critical(saved);
-}
-
-
-/**
- * @brief 非阻塞读取 USB 接收缓冲（应用层任务上下文）
- *
- * 读出最多 maxlen 字节并同时从缓冲移除；无数据时立即返回 0。
- *
- * @param out    输出缓冲
- * @param maxlen 期望读取的最大字节数
- * @return 实际读出的字节数
- */
-uint32_t bsp_log_rx_read(uint8_t *out, uint32_t maxlen)
-{
-    uint32_t n = 0U;
-
-    if ((out == NULL) || (maxlen == 0U))
-    {
-        return 0U;
-    }
-
-    UBaseType_t saved = log_enter_critical();
-    uint32_t avail = (s_log_rx_head - s_log_rx_tail) & (LOG_RX_BUF_SIZE - 1U);
-    if (avail > 0U)
-    {
-        n = (avail > maxlen) ? maxlen : avail;
-        uint32_t cont = LOG_RX_BUF_SIZE - s_log_rx_tail;
-        if (n <= cont)
-        {
-            memcpy(out, &s_log_rx_buf[s_log_rx_tail], n);
-        }
-        else
-        {
-            memcpy(out, &s_log_rx_buf[s_log_rx_tail], cont);
-            memcpy(out + cont, &s_log_rx_buf[0], n - cont);
-        }
-        s_log_rx_tail = (s_log_rx_tail + n) & (LOG_RX_BUF_SIZE - 1U);
-    }
-    log_exit_critical(saved);
-    return n;
-}
-
-
-/**
  * @brief 获取发送缓冲满丢弃的日志条数
  * @return 丢弃条数
  */
@@ -361,19 +230,10 @@ static void log_tx_task(void *arg)
 {
     (void)arg;
 
-    uint8_t usb_announced = 0U; /* USB 通道切换提示只打印一次 */
-
     /* 启动后先冲刷调度器启动前积压的日志（此时尚无任务通知） */
     log_tx_flush();
     for (;;)
     {
-        /* USB 首次枚举成功后打印一次提示：此后启动积压与运行期日志全部经 USB 发出 */
-        if ((usb_announced == 0U) && (s_usb_connected != 0U))
-        {
-            usb_announced = 1U;
-            LOG_I("LogTx", "USB CDC 已连接，启动阶段日志随后经 USB 补发");
-        }
-
         log_tx_flush();
         ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
     }
@@ -383,14 +243,11 @@ static void log_tx_task(void *arg)
 /**
  * @brief 消费发送缓冲（仅日志任务调用）
  *
- * 通道策略（USB 是唯一日志口）：
- *   1) USB 未枚举：日志全部留在缓冲中不消费、不旁路，上电即缓存；
- *      枚举成功后 CDC_Init_FS 唤醒本任务统一经 USB 补发，因此无论何时插入
- *      USB、打开串口助手或复位重启，都能从开机第一行看到完整日志；
- *   2) USB 已枚举：CDC_Transmit_FS 整包（<=LOG_USB_CHUNK_SIZE）提交，提交成功后
- *      前进读索引并返回等完成回调再发下一包（余量留在缓冲）；忙则返回等完成回调；
- *   3) 类数据未就绪（枚举中间态）：让出 1 tick 重试；发送失败（USBD_FAIL，
- *      连接标志与物理状态不一致）：丢弃最旧一段并计数，防止任务空转。
+ * 通道策略（UART 唯一日志口，USART6 中断发送）：
+ *   1) USART6 就绪：USARTSend(IT) 整段（<=LOG_UART_CHUNK_SIZE）提交，
+ *      等硬件发完（TC 中断恢复 gState）再前进读索引；等待带 1s 超时保护，
+ *      超时强制 abort 防止中断异常时任务空转；
+ *   2) USART6 不可用（未初始化）：丢弃最旧一段并计数，防止任务空转。
  */
 static void log_tx_flush(void)
 {
@@ -407,46 +264,44 @@ static void log_tx_flush(void)
             return; /* 缓冲已空，挂起等下一次通知 */
         }
 
-        /* ---- USB 未枚举：日志全量缓存等待，上电日志一条都不旁路 ---- */
-        if (s_usb_connected == 0U)
-        {
-            return; /* 不消费、不发送，等 CDC_Init_FS 置位连接标志后唤醒统一补发 */
-        }
-
-        /* ---- 类数据未就绪（枚举中间态）：让出 1 tick 后重试 ---- */
-        if (hUsbDeviceFS.pClassData == NULL)
-        {
-            vTaskDelay(1);
-            continue;
-        }
-
-        /* ---- USB CDC 主通道（唯一日志口） ---- */
-        uint32_t chunk = (avail > LOG_USB_CHUNK_SIZE) ? LOG_USB_CHUNK_SIZE : avail;
+        uint32_t chunk = (avail > LOG_UART_CHUNK_SIZE) ? LOG_UART_CHUNK_SIZE : avail;
         uint32_t cont = LOG_BUF_SIZE - rd; /* 到缓冲末尾的连续字节数 */
         if (chunk > cont)
         {
             chunk = cont;
         }
 
-        uint8_t res = CDC_Transmit_FS(&s_log_tx_buf[rd], (uint16_t)chunk);
-        if (res == USBD_OK)
+        /* ---- UART 主通道（USART6 中断发送，非阻塞） ---- */
+        if ((uart10.usart_handle != NULL) &&
+            (uart10.usart_handle->gState == HAL_UART_STATE_READY))
         {
-            /* PCD 非 DMA：提交时数据已写入端点 FIFO，可安全前进读索引 */
+            USARTSend(&uart10, &s_log_tx_buf[rd], (uint16_t)chunk, USART_TRANSFER_IT);
+
+            /* 等硬件发送完成（TC 中断里 HAL 恢复 gState=READY），期间让出 CPU。
+             * 发送期间生产者的空闲区计算基于未前进的读索引，不会覆盖在发数据。 */
+            uint32_t timeout = 0U;
+            while (uart10.usart_handle->gState != HAL_UART_STATE_READY)
+            {
+                if (++timeout > 1000U)
+                {
+                    /* 1s 超时：UART 中断异常，强制中止恢复通道 */
+                    HAL_UART_AbortTransmit(uart10.usart_handle);
+                    break;
+                }
+                vTaskDelay(1);
+            }
             saved = log_enter_critical();
             s_log_tx_rd = (rd + chunk) & (LOG_BUF_SIZE - 1U);
             log_exit_critical(saved);
-            return; /* 等 CDC_TransmitCplt_FS 通知后继续发余量 */
         }
-        else if (res == USBD_BUSY)
+        else
         {
-            return; /* 上一包还在传输，完成回调会再次唤醒 */
+            /* UART 不可用：丢弃该段并计数，防止任务空转 */
+            saved = log_enter_critical();
+            s_log_tx_rd = (rd + chunk) & (LOG_BUF_SIZE - 1U);
+            s_log_tx_drop_cnt++;
+            log_exit_critical(saved);
         }
-
-        /* USBD_FAIL：连接标志与物理状态不一致（异常态），丢弃最旧一段防任务空转 */
-        saved = log_enter_critical();
-        s_log_tx_rd = (rd + chunk) & (LOG_BUF_SIZE - 1U);
-        s_log_tx_drop_cnt++;
-        log_exit_critical(saved);
     }
 }
 

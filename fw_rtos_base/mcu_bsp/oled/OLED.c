@@ -174,7 +174,7 @@ void OLED_GPIO_Init(void)
 	OLED_Delay_us(100000U);	/*100ms 上电稳定等待（DWT 忙等待，不依赖中断）*/
 	
 	/*调试日志：供电已稳定，开始配置引脚（日志必须放在上电延时之后）*/
-	LOG_I("oled", "上电延时完成，SCL=PB10/SDA=PB9 配置为开漏输出");
+	LOG_I("oled", "power-on delay done, SCL=PB10/SDA=PB9 open-drain");
 	
 	/*将SCL和SDA引脚初始化为开漏模式（软件I2C，上拉由外部硬件提供）*/
 	__HAL_RCC_GPIOB_CLK_ENABLE();
@@ -190,7 +190,7 @@ void OLED_GPIO_Init(void)
 	OLED_W_SDA(1);
 	
 	/*调试日志：引脚配置完成*/
-	LOG_I("oled", "GPIO 初始化完成（PB10=SCL/PB9=SDA 开漏），总线已释放");
+	LOG_I("oled", "GPIO init done (PB10=SCL/PB9=SDA open-drain), bus released");
 }
 
 /*********************引脚配置*/
@@ -252,7 +252,7 @@ void OLED_I2C_SendByte(uint8_t Byte)
 		if (s_ack_fail_logged == 0U)
 		{
 		s_ack_fail_logged = 1U;
-			LOG_E("oled", "I2C 无应答：检查接线(SCL=PB10/SDA=PB9)/外部上拉/供电/地址(0x78)");
+			LOG_E("oled", "I2C no ACK: check wiring(SCL=PB10/SDA=PB9)/pullup/power/addr(0x78)");
 		}
 	}
 	OLED_W_SCL(0);
@@ -269,7 +269,7 @@ void OLED_WriteCommand(uint8_t Command)
 	if (s_first_command != 0U)
 	{
 		s_first_command = 0U;
-		LOG_I("oled", "软件I2C 首条命令已发出（Command=0x%02X）", Command);
+		LOG_I("oled", "software-I2C first command sent (Command=0x%02X)", Command);
 	}
 	OLED_I2C_Start();				//I2C起始
 	OLED_I2C_SendByte(OLED_I2C_ADDRESS);		//发送OLED的I2C从机地址
@@ -313,7 +313,7 @@ void OLED_WriteData(uint8_t *Data, uint8_t Count)
 void OLED_Init(void)
 {
 	OLED_GPIO_Init();			//先调用底层的端口初始化
-	LOG_I("oled", "开始发送 SH1106 初始化序列（I2C 地址 0x78）");
+	LOG_I("oled", "sending SH1106 init sequence (I2C addr 0x78)");
 	
 	/*写入一系列的命令，对OLED进行初始化配置*/
 	OLED_WriteCommand(0xAE);	//设置显示开启/关闭，0xAE关闭，0xAF开启
@@ -356,7 +356,7 @@ void OLED_Init(void)
 	
 	OLED_Clear();				//清空显存数组
 	OLED_Update();				//更新显示，清屏，防止初始化后未显示内容时花屏
-	LOG_I("oled", "OLED 初始化完成，已清屏");
+	LOG_I("oled", "OLED init done, screen cleared");
 }
 
 /**

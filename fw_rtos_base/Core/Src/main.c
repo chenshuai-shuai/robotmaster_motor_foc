@@ -23,7 +23,6 @@
 #include "dma.h"
 #include "tim.h"
 #include "usart.h"
-#include "usb_device.h"
 #include "gpio.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -114,7 +113,6 @@ int main(void)
   MX_TIM4_Init();
   MX_TIM5_Init();
   MX_CAN1_Init();
-  MX_USB_DEVICE_Init();
   /* USER CODE BEGIN 2 */
   /* ---- 阶段1：最小系统验证（流水灯） ----
    * 暂时停用：舵机/遥控任务（main_cpp）、单电机测试（MotorTest）。
