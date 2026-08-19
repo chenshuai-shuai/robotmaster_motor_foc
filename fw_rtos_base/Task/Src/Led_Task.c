@@ -66,11 +66,11 @@ static void led_task(void *arg)
     (void)arg;
     int i;
 
-    printf("\r\n[LedTask] 启动：板载绿PF14/红PE11 + 外接8灯PG1~8\r\n");
+    // LOG_I("LedTask", "启动：板载绿PF14/红PE11 + 外接8灯PG1~8");  /* LED日志已关 */
 
     /* 第0步：8 灯全亮 1s（验证接线，逐个在串口报数） */
     for (i = 0; i < 8; i++) LED_EXT_ON(i);
-    printf("[LedTask] 8灯全亮 1 秒——检查接线\r\n");
+    // LOG_I("LedTask", "8灯全亮 1 秒——检查接线");  /* LED日志已关 */
     vTaskDelay(1000);
     for (i = 0; i < 8; i++) LED_EXT_OFF(i);
     vTaskDelay(300);
@@ -88,7 +88,7 @@ static void led_task(void *arg)
             if (i & 1) { LED_ON(LED_RED);   LED_OFF(LED_GREEN); }
             else       { LED_ON(LED_GREEN); LED_OFF(LED_RED);   }
 
-            printf("[LedTask] 第%d灯亮 (PG%d)\r\n", i + 1, i + 1);
+            // LOG_I("LedTask", "第%d灯亮 (PG%d)", i + 1, i + 1);  /* LED日志已关 */
             vTaskDelay(150);
         }
     }

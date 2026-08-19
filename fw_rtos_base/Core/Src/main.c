@@ -33,6 +33,8 @@
 #include "math.h"
 #include "Led_Task.h"
 #include "bsp_usart.h"
+#include "OLED.h"
+#include "Oled_Task.h"
 extern void UART10_Init(void);
 /* USER CODE END Includes */
 
@@ -127,6 +129,8 @@ int main(void)
   // MotorTest_Task_Init();/* 阶段1停用：单电机测试 */
   UART10_Init();            /* 日志串口必须先于 LED 任务（任务里 printf 依赖 uart10） */
   Led_Task_Init();          /* LED 流水灯任务 */
+  OLED_Init();              /* OLED 显示屏（软件I2C：PB10=SCL/PB9=SDA，地址0x78） */
+  Oled_Task_Init();         /* OLED 显示任务：画面绘制/周期刷新由任务执行 */
 //	HAL_TIM_PWM_Start(&htim4,TIM_CHANNEL_1);
 //	int debug_pwm=0;
 

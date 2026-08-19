@@ -31,19 +31,19 @@ void printMatrix(const Matrix *matrix)
 {
     if (!matrix || !matrix->data)
     {
-        LOGERROR("Invalid matrix or matrix data.\n");
+        LOG_E("matrix", "Invalid matrix or matrix data.");
         return;
     }
 
-    LOGINFO("Matrix (%d x %d):\n", matrix->row, matrix->column);
+    LOG_I("matrix", "Matrix (%d x %d):", matrix->row, matrix->column);
     for (int i = 0; i < matrix->row; i++)
     {
         for (int j = 0; j < matrix->column; j++)
         {
             // 使用偏移量计算元素位置
-            LOG_PRINT("%f ", matrix->data[i * matrix->column + j]);
+            printf("%f ", matrix->data[i * matrix->column + j]);
         }
-        LOG_PRINT("\n"); // 换行
+        printf("\n"); // 换行（触发行攒发提交）
     }
 }
 

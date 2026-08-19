@@ -76,8 +76,8 @@ static void motor_test_task(void *arg)
     /* 使能 1 号电机（其余 3 个电机保持禁用，电流自动清零） */
     C610_Group_instnce[0]->motor_instnce[0].motor_cofig.motor_enable_flag = MOTOR_ENABLED;
 
-    printf("\r\n[MotorTest] C610/M2006 单电机测试启动\r\n");
-    printf("[MotorTest] CAN1 1Mbps, 命令帧 0x200, 反馈 0x201, 电流量程 ±10A\r\n");
+    LOG_I("MotorTest", "C610/M2006 单电机测试启动");
+    LOG_I("MotorTest", "CAN1 1Mbps, 命令帧 0x200, 反馈 0x201, 电流量程 ±10A");
     phase_enter(TEST_IDLE);
 
     while (1)
@@ -98,7 +98,7 @@ static void motor_test_task(void *arg)
                 if (elapsed >= IDLE_MS)
                 {
                     phase_enter(TEST_RAMP_UP);
-                    printf("[MotorTest] → RAMP_UP (0→%.1fA, %dms)\r\n", RAMP_UP_CURRENT_A, RAMP_UP_MS);
+                    LOG_I("MotorTest", "→ RAMP_UP (0→%.1fA, %dms)", RAMP_UP_CURRENT_A, RAMP_UP_MS);
                 }
                 break;
             case TEST_RAMP_UP:
@@ -106,7 +106,7 @@ static void motor_test_task(void *arg)
                 if (elapsed >= RAMP_UP_MS)
                 {
                     phase_enter(TEST_HOLD);
-                    printf("[MotorTest] → HOLD (%.1fA)\r\n", HOLD_CURRENT_A);
+                    LOG_I("MotorTest", "→ HOLD (%.1fA)", HOLD_CURRENT_A);
                 }
                 break;
             case TEST_HOLD:
@@ -114,7 +114,7 @@ static void motor_test_task(void *arg)
                 if (elapsed >= HOLD_MS)
                 {
                     phase_enter(TEST_RAMP_DOWN);
-                    printf("[MotorTest] → RAMP_DOWN\r\n");
+                    LOG_I("MotorTest", "→ RAMP_DOWN");
                 }
                 break;
             case TEST_RAMP_DOWN:
@@ -122,7 +122,7 @@ static void motor_test_task(void *arg)
                 if (elapsed >= RAMP_DOWN_MS)
                 {
                     phase_enter(TEST_DONE);
-                    printf("[MotorTest] → DONE (电机停)\r\n");
+                    LOG_I("MotorTest", "→ DONE (电机停)");
                 }
                 break;
             case TEST_DONE:
@@ -130,7 +130,7 @@ static void motor_test_task(void *arg)
                 if (elapsed >= IDLE_MS * 2)
                 {
                     phase_enter(TEST_IDLE);
-                    printf("[MotorTest] → IDLE (下一轮)\r\n");
+                    LOG_I("MotorTest", "→ IDLE (下一轮)");
                 }
                 break;
             default:
@@ -152,7 +152,7 @@ static void motor_test_task(void *arg)
             int16_t rpm_raw = (int16_t)m->get.velocity;     /* 单位 RPM */
             int16_t cur_raw = (int16_t)m->get.current;      /* 实际输出转矩原始值 */
 
-            printf("[MotorTest] phase=%d | 角度=%d(%.1f°) 转速=%dRPM 电流raw=%d | 命令%.2fA\r\n",
+            LOG_I("MotorTest", "phase=%d | 角度=%d(%.1f°) 转速=%dRPM 电流raw=%d | 命令%.2fA",
                    (int)s_phase, ecd_raw, (float)ecd_raw / 8191.0f * 360.0f,
                    rpm_raw, cur_raw, C610_RAW_TO_CURRENT(m->set.current));
         }

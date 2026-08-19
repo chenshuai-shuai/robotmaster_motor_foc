@@ -22,6 +22,7 @@
 #include "usbd_cdc_if.h"
 
 /* USER CODE BEGIN INCLUDE */
+#include "../../mcu_bsp/log/bsp_log.h"
 
 /* USER CODE END INCLUDE */
 
@@ -155,6 +156,8 @@ static int8_t CDC_Init_FS(void)
   /* Set Application Buffers */
   USBD_CDC_SetTxBuffer(&hUsbDeviceFS, UserTxBufferFS, 0);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, UserRxBufferFS);
+  /* 主机 SET_CONFIGURATION 完成：置位连接标志，日志任务切换 USB 通道 */
+  bsp_log_set_usb_connected(1U);
   return (USBD_OK);
   /* USER CODE END 3 */
 }
@@ -166,6 +169,8 @@ static int8_t CDC_Init_FS(void)
 static int8_t CDC_DeInit_FS(void)
 {
   /* USER CODE BEGIN 4 */
+  /* USB 复位/断开：清除连接标志，日志任务回落 UART 通道 */
+  bsp_log_set_usb_connected(0U);
   return (USBD_OK);
   /* USER CODE END 4 */
 }
@@ -261,6 +266,9 @@ static int8_t CDC_Control_FS(uint8_t cmd, uint8_t* pbuf, uint16_t length)
 static int8_t CDC_Receive_FS(uint8_t* Buf, uint32_t *Len)
 {
   /* USER CODE BEGIN 6 */
+  /* 收到的数据推入 bsp_log 接收环形缓冲（应用层经 bsp_log_rx_read 消费，不 echo、不转发）；
+   * 本回调在 USB 中断上下文，push 内部临界区保护。 */
+  bsp_log_rx_push(Buf, *Len);
   USBD_CDC_SetRxBuffer(&hUsbDeviceFS, &Buf[0]);
   USBD_CDC_ReceivePacket(&hUsbDeviceFS);
   return (USBD_OK);
@@ -311,6 +319,8 @@ static int8_t CDC_TransmitCplt_FS(uint8_t *Buf, uint32_t *Len, uint8_t epnum)
   UNUSED(Buf);
   UNUSED(Len);
   UNUSED(epnum);
+  /* USB IN 传输完成（中断上下文）：唤醒日志任务发送下一包 */
+  bsp_log_notify_tx_cplt_from_isr();
   /* USER CODE END 13 */
   return result;
 }
