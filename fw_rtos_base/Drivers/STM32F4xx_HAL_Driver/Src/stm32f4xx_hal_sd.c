@@ -257,6 +257,9 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "stm32f4xx_hal.h"
+#include "bsp_log.h"
+
+extern volatile uint32_t g_sd_step;  /* 诊断：写路径步进标记 */
 
 #if defined(SDIO)
 
@@ -591,6 +594,7 @@ HAL_StatusTypeDef HAL_SD_ReadBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint3
 
     /* Initialize data control register */
     hsd->Instance->DCTRL = 0U;
+    LOG_D("sdhal", "DCTRL cleared; add=%lu", (unsigned long)add);
 
     if(hsd->SdCard.CardType != CARD_SDHC_SDXC)
     {
@@ -785,7 +789,11 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint
 {
   SDIO_DataInitTypeDef config;
   uint32_t errorstate;
+  /* diag-clean */
   uint32_t tickstart = HAL_GetTick();
+  LOG_D("sdhal", "WB enter: pData=%p add=%lu n=%lu state=%lu ctype=%lu TO=%lu",
+        (void *)pData, (unsigned long)BlockAdd, (unsigned long)NumberOfBlocks,
+        (unsigned long)hsd->State, (unsigned long)hsd->SdCard.CardType, (unsigned long)Timeout);
   uint32_t count, data, dataremaining;
   uint32_t add = BlockAdd;
   uint8_t *tempbuff = pData;
@@ -810,6 +818,7 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint
 
     /* Initialize data control register */
     hsd->Instance->DCTRL = 0U;
+    LOG_D("sdhal", "DCTRL cleared; add=%lu", (unsigned long)add);
 
     if(hsd->SdCard.CardType != CARD_SDHC_SDXC)
     {
@@ -824,6 +833,10 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint
     config.TransferMode  = SDIO_TRANSFER_MODE_BLOCK;
     config.DPSM          = SDIO_DPSM_ENABLE;
     (void)SDIO_ConfigData(hsd->Instance, &config);
+    LOG_D("sdhal", "ConfigData done: DCTRL=0x%lX DLEN=%lu DTIMER=0x%lX STA=0x%lX FIFOCNT=%lu",
+          (unsigned long)hsd->Instance->DCTRL, (unsigned long)hsd->Instance->DLEN,
+          (unsigned long)hsd->Instance->DTIMER, (unsigned long)hsd->Instance->STA,
+          (unsigned long)hsd->Instance->FIFOCNT);
 
     /* Write Blocks in Polling mode */
     if(NumberOfBlocks > 1U)
@@ -840,6 +853,8 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint
       /* Write Single Block command */
       errorstate = SDMMC_CmdWriteSingleBlock(hsd->Instance, add);
     }
+    LOG_D("sdhal", "CMD done: errstate=0x%lX STA=0x%lX", (unsigned long)errorstate,
+          (unsigned long)hsd->Instance->STA);
     if(errorstate != HAL_SD_ERROR_NONE)
     {
       /* Clear all the static flags */
@@ -877,6 +892,8 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint
           dataremaining--;
           (void)SDIO_WriteFIFO(hsd->Instance, &data);
         }
+        g_sd_step = 88U;   /* 诊断：TXFIFOHE 曾置位，CPU 已填过 FIFO（循环内禁止日志：
+                             * vsnprintf 20-30µs 会耗尽 FIFO 余量 37µs 缓冲致 TXUNDERR） */
       }
 
       if(((HAL_GetTick()-tickstart) >=  Timeout) || (Timeout == 0U))
@@ -889,6 +906,9 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks(SD_HandleTypeDef *hsd, uint8_t *pData, uint
         return HAL_TIMEOUT;
       }
     }
+    LOG_D("sdhal", "poll loop EXIT: STA=0x%lX DCOUNT=%lu FIFOCNT=%lu rem=%lu",
+          (unsigned long)hsd->Instance->STA, (unsigned long)hsd->Instance->DCOUNT,
+          (unsigned long)hsd->Instance->FIFOCNT, (unsigned long)dataremaining);
 
     /* Send stop transmission command in case of multiblock write */
     if(__HAL_SD_GET_FLAG(hsd, SDIO_FLAG_DATAEND) && (NumberOfBlocks > 1U))
@@ -1231,7 +1251,7 @@ HAL_StatusTypeDef HAL_SD_ReadBlocks_DMA(SD_HandleTypeDef *hsd, uint8_t *pData, u
         add *= 512U;
       }
 
-      /* Configure the SD DPSM (Data Path State Machine) */
+        /* Configure the SD DPSM (Data Path State Machine) */
       config.DataTimeOut   = SDMMC_DATATIMEOUT;
       config.DataLength    = BLOCKSIZE * NumberOfBlocks;
       config.DataBlockSize = SDIO_DATABLOCK_SIZE_512B;
@@ -1292,6 +1312,7 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks_DMA(SD_HandleTypeDef *hsd, uint8_t *pData, 
   SDIO_DataInitTypeDef config;
   uint32_t errorstate;
   uint32_t add = BlockAdd;
+  g_sd_step = 1U;
 
   if(NULL == pData)
   {
@@ -1348,7 +1369,9 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks_DMA(SD_HandleTypeDef *hsd, uint8_t *pData, 
       hsd->Context = (SD_CONTEXT_WRITE_SINGLE_BLOCK | SD_CONTEXT_DMA);
 
       /* Write Single Block command */
+      g_sd_step = 2U;
       errorstate = SDMMC_CmdWriteSingleBlock(hsd->Instance, add);
+      g_sd_step = 3U;
     }
     if(errorstate != HAL_SD_ERROR_NONE)
     {
@@ -1361,6 +1384,7 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks_DMA(SD_HandleTypeDef *hsd, uint8_t *pData, 
     }
 
     /* Enable SDIO DMA transfer */
+    g_sd_step = 4U;
     __HAL_SD_DMA_ENABLE(hsd);
 
     /* Force DMA Direction */
@@ -1383,6 +1407,7 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks_DMA(SD_HandleTypeDef *hsd, uint8_t *pData, 
     }
     else
     {
+        g_sd_step = 5U;  /* DMA started */
       /* Configure the SD DPSM (Data Path State Machine) */
       config.DataTimeOut   = SDMMC_DATATIMEOUT;
       config.DataLength    = BLOCKSIZE * NumberOfBlocks;
@@ -1391,7 +1416,9 @@ HAL_StatusTypeDef HAL_SD_WriteBlocks_DMA(SD_HandleTypeDef *hsd, uint8_t *pData, 
       config.TransferMode  = SDIO_TRANSFER_MODE_BLOCK;
       config.DPSM          = SDIO_DPSM_ENABLE;
       (void)SDIO_ConfigData(hsd->Instance, &config);
+      g_sd_step = 6U;
 
+      g_sd_step = 7U;
       return HAL_OK;
     }
   }

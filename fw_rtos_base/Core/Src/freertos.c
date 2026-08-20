@@ -20,6 +20,7 @@
 /* Includes ------------------------------------------------------------------*/
 #include "FreeRTOS.h"
 #include "task.h"
+#include "bsp_log.h"
 #include "main.h"
 #include "cmsis_os.h"
 
@@ -133,3 +134,33 @@ void StartDefaultTask(void const * argument)
 /* USER CODE BEGIN Application */
 
 /* USER CODE END Application */
+
+/* USER CODE BEGIN 4 */
+/* 栈溢出钩子：采集完整案发现场到 4 个全局变量（Keil Watch 一次读全）：
+ *   s_overflow_task   任务名（可能被踩空）
+ *   s_overflow_handle 溢出任务的 TCB 句柄
+ *   s_overflow_psp    溢出时的 PSP（任务栈指针，对比 TCB 栈边界定位过界量）
+ *   s_overflow_cfsr   溢出时刻的 CFSR（Keil reset+halt 会清掉真实 CFSR，这里先存）
+ * 红 LED 常亮 = 栈溢出发生。 */
+char s_overflow_task[16] = {0};
+volatile uint32_t s_overflow_handle = 0U;
+volatile uint32_t s_overflow_psp = 0U;
+volatile uint32_t s_overflow_cfsr = 0U;
+
+void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
+{
+    if (pcTaskName != NULL)
+    {
+        for (int i = 0; (i < 15) && (pcTaskName[i] != '\0'); i++)
+        {
+            s_overflow_task[i] = pcTaskName[i];
+        }
+    }
+    s_overflow_handle = (uint32_t)xTask;
+    s_overflow_psp = (uint32_t)__get_PSP();
+    s_overflow_cfsr = SCB->CFSR;
+    HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11, GPIO_PIN_RESET);  /* 红LED亮 */
+    taskDISABLE_INTERRUPTS();
+    for (;;) {}
+}
+/* USER CODE END 4 */

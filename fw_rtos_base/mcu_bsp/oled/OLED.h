@@ -35,7 +35,7 @@ void OLED_ReverseArea(uint8_t X, uint8_t Y, uint8_t Width, uint8_t Height);
 
 /*显示函数*/
 void OLED_ShowChar(uint8_t X, uint8_t Y, char Char, uint8_t FontSize);
-void OLED_ShowString(uint8_t X, uint8_t Y, char *String, uint8_t FontSize);
+void OLED_ShowString(uint8_t X, uint8_t Y, const char *String, uint8_t FontSize);
 void OLED_ShowNum(uint8_t X, uint8_t Y, uint32_t Number, uint8_t Length, uint8_t FontSize);
 void OLED_ShowSignedNum(uint8_t X, uint8_t Y, int32_t Number, uint8_t Length, uint8_t FontSize);
 void OLED_ShowHexNum(uint8_t X, uint8_t Y, uint32_t Number, uint8_t Length, uint8_t FontSize);

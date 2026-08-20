@@ -19,6 +19,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "sd_sdio.h"
 #include "stm32f4xx_it.h"
 #include "FreeRTOS.h"
 #include "task.h"
@@ -86,10 +87,26 @@ void NMI_Handler(void)
 /**
   * @brief This function handles Hard fault interrupt.
   */
+/* HardFault 现场自记录（防 Keil RST 冲掉现场）：
+ * .bss 变量在软复位/调试复位后不清零（仅上电清），
+ * Keil Stop/RST 后在 Watch 窗口看 s_hf_pc 即可读崩点。
+ * 异常帧布局（MSP）：[0]=R0 [1]=R1 [2]=R2 [3]=R3 [4]=R12 [5]=LR [6]=PC [7]=xPSR */
+volatile uint32_t s_hf_pc = 0U, s_hf_lr = 0U, s_hf_psp = 0U;
+volatile uint32_t s_hf_cfsr = 0U, s_hf_hfsr = 0U, s_hf_msp = 0U;
+
 void HardFault_Handler(void)
 {
   /* USER CODE BEGIN HardFault_IRQn 0 */
   /* USER CODE END HardFault_IRQn 0 */
+  uint32_t *frame = (uint32_t *)__get_MSP();
+  s_hf_msp  = (uint32_t)frame;
+  s_hf_pc   = frame[6];
+  s_hf_lr   = frame[5];
+  s_hf_psp  = (uint32_t)__get_PSP();
+  s_hf_cfsr = SCB->CFSR;
+  s_hf_hfsr = SCB->HFSR;
+  /* 红 LED 快闪指示 HardFault */
+  HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11, GPIO_PIN_RESET);
   while (1)
   {
     /* USER CODE BEGIN W1_HardFault_IRQn 0 */
@@ -271,3 +288,26 @@ void USART6_IRQHandler(void)
 /* USER CODE BEGIN 1 */
 
 /* USER CODE END 1 */
+
+/* SDIO 中断：转发给 sd_sdio.c（SD 卡 4-bit 传输） */
+void SDIO_IRQHandler(void)
+{
+  /* USER CODE BEGIN SDIO_IRQn 0 */
+
+  /* USER CODE END SDIO_IRQn 0 */
+  SD_SDIO_IRQHandler();
+  /* USER CODE BEGIN SDIO_IRQn 1 */
+
+  /* USER CODE END SDIO_IRQn 1 */
+}
+
+/* SDIO 写 DMA 完成中断（SD 卡数据写入状态推进） */
+void DMA2_Stream6_IRQHandler(void)
+{
+  SD_SDIO_DMA_TX_IRQHandler();
+}
+
+void DMA2_Stream3_IRQHandler(void)
+{
+  SD_SDIO_DMA_RX_IRQHandler();
+}

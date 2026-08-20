@@ -31,7 +31,7 @@
 #define LOG_BUF_SIZE         4096U   /* 发送环形缓冲总字节数（2 的幂） */
 #define LOG_UART_CHUNK_SIZE  128U    /* UART 中断发送单段上限 */
 #define LOG_TASK_PRIORITY    1U      /* 发送任务优先级：最低，让出 CPU */
-#define LOG_TASK_STACK_WORDS 192U    /* 发送任务栈深度（字） */
+#define LOG_TASK_STACK_WORDS 512U    /* 发送任务栈深度（字）：USART 发送链加深 */
 #define LOG_FMT_BUF_SIZE     128U    /* 单条日志栈上格式化缓冲，超长截断 */
 #define LOG_FPUT_BUF_SIZE    128U    /* fputc(printf) 行攒发缓冲 */
 
