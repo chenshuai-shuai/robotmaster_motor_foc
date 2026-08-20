@@ -157,6 +157,7 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "stm32f4xx_hal.h"
+#include "bsp_log.h"
 
 #if defined(SDIO)
 
@@ -1196,6 +1197,7 @@ uint32_t SDMMC_GetCmdResp1(SDIO_TypeDef *SDIOx, uint8_t SD_CMD, uint32_t Timeout
   /* 8 is the number of required instructions cycles for the below loop statement.
   The Timeout is expressed in ms */
   uint32_t count = Timeout * (SystemCoreClock / 8U /1000U);
+  uint32_t diag_cnt = 0U;   /* 诊断：等待进度（每 ~3.4s 打一次卡状态） */
   
   do
   {
@@ -1204,6 +1206,13 @@ uint32_t SDMMC_GetCmdResp1(SDIO_TypeDef *SDIOx, uint8_t SD_CMD, uint32_t Timeout
       return SDMMC_ERROR_TIMEOUT;
     }
     sta_reg = SDIOx->STA;
+    diag_cnt++;
+    if ((diag_cnt & 0x03FFFFFFUL) == 0UL)
+    {
+      LOG_D("sdcmd", "waiting CMD rsp: STA=0x%lX DTIMER=0x%lX DCTRL=0x%lX",
+            (unsigned long)sta_reg, (unsigned long)SDIOx->DTIMER,
+            (unsigned long)SDIOx->DCTRL);
+    }
   }while(((sta_reg & (SDIO_FLAG_CCRCFAIL | SDIO_FLAG_CMDREND | SDIO_FLAG_CTIMEOUT)) == 0U) ||
          ((sta_reg & SDIO_FLAG_CMDACT) != 0U ));
     

@@ -341,7 +341,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F427xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Task/Inc;../Device/Inc;../mcu_bsp/can;../mcu_bsp/Motor;../mcu_bsp/button;../mcu_bsp/protocol;../mcu_bsp/protocol_calibration;../mcu_bsp/uart;../mcu_bsp/log;../mcu_bsp/oled;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Middlewares/Third_Party/FatFs/src;../Middlewares/Third_Party/FatFs/src/option;../mcu_bsp/sd;../mcu_bsp/fs;../mcu_bsp/version;../mcu_bsp/sys_status</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Task/Inc;../Device/Inc;../mcu_bsp/can;../mcu_bsp/Motor;../mcu_bsp/button;../mcu_bsp/protocol;../mcu_bsp/protocol_calibration;../mcu_bsp/uart;../mcu_bsp/log;../mcu_bsp/oled;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Middlewares/Third_Party/FatFs/src;../Middlewares/Third_Party/FatFs/src/option;../mcu_bsp/sd;../mcu_bsp/fs;../mcu_bsp/version;../mcu_bsp/sys_status;../mcu_bsp/cli</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -1080,6 +1080,11 @@
           <GroupName>BSP</GroupName>
           <Files>
             <File>
+        <FileName>sd_cli.c</FileName>
+        <FileType>1</FileType>
+        <FilePath>..\mcu_bsp\cli\sd_cli.c</FilePath>
+      </File>
+      <File>
               <FileName>sys_status.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\mcu_bsp\sys_status\sys_status.c</FilePath>

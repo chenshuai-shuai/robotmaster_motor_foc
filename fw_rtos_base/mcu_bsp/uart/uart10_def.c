@@ -17,7 +17,7 @@ void UART10_Init(void)
 {
     USART_Init_Config_s cfg = {0};
     cfg.usart_handle = &huart6;          /* 默认 USART6，可在 CubeMX 里配置引脚 */
-    cfg.recv_buff_size = 64;             /* 日志只发不收，接收缓冲给个保底 */
+    cfg.recv_buff_size = 128;            /* CLI 命令行接收（行长 96） */
     cfg.module_callback = NULL;
     USARTRegister(&uart10, &cfg);
 }

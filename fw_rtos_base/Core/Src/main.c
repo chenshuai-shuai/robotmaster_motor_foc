@@ -38,6 +38,7 @@
 #include "version.h"
 #include "bsp_log.h"
 #include "sys_status.h"
+#include "sd_cli.h"
 extern void UART10_Init(void);
 /* USER CODE END Includes */
 
@@ -130,12 +131,14 @@ int main(void)
   // main_cpp();          /* 阶段1停用：舵机+遥控任务 */
   // MotorTest_Task_Init();/* 阶段1停用：单电机测试 */
   UART10_Init();            /* 日志串口必须先于 LED 任务（任务里 printf 依赖 uart10） */
+  SD_CLI_Init();             /* SD 卡命令行（uart10 接收回调注册） */
   LOG_I("fw", "=== firmware %s (release %s, built %s %s) ===",
         FW_VERSION_STR, FW_RELEASE_STR, FW_BUILD_DATE, FW_BUILD_TIME);  /* 双版本标识 */
   Led_Task_Init();          /* LED 流水灯任务 */
   OLED_Init();              /* OLED 显示屏（软件I2C：PB10=SCL/PB9=SDA，地址0x78） */
   Oled_Task_Init();      /* 状态屏任务（二分法排查结束，恢复） */
   SdCard_Task_Init();
+  xTaskCreate(SD_CLI_TaskEntry, "CliTask", 512, NULL, 3, NULL);  /* SD 命令行任务 */
   SYS_SetState(SYS_STATE_RUNNING);         /* OLED 显示任务：画面绘制/周期刷新由任务执行 */
 //	HAL_TIM_PWM_Start(&htim4,TIM_CHANNEL_1);
 //	int debug_pwm=0;

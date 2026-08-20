@@ -28,7 +28,7 @@
 /* ---- 日志通道参数（集中配置） ---- */
 /* UART 唯一日志口（USART6，经 uart10 实例中断发送）：环形缓冲平滑日志洪峰，
  * 缓冲满时丢弃新日志保头部（启动日志优先）。 */
-#define LOG_BUF_SIZE         4096U   /* 发送环形缓冲总字节数（2 的幂） */
+#define LOG_BUF_SIZE         16384U  /* 发送环形缓冲总字节数（2 的幂）：诊断期 16KB 防洪峰丢弃 */
 #define LOG_UART_CHUNK_SIZE  128U    /* UART 中断发送单段上限 */
 #define LOG_TASK_PRIORITY    1U      /* 发送任务优先级：最低，让出 CPU */
 #define LOG_TASK_STACK_WORDS 512U    /* 发送任务栈深度（字）：USART 发送链加深 */
@@ -69,6 +69,7 @@
 
 /* 栈上格式化一条日志并一次提交（自动补 CRLF；无共享缓冲竞争，多任务安全） */
 void log_out(uint8_t level, const char *tag, const char *fmt, ...);
+void log_raw(const char *str, uint16_t len);  /* 无时间戳无标签直发（CLI 提示符/回显用） */
 
 /* 非阻塞写发送缓冲（log_out 与 printf/fputc 的底层出口） */
 void debug_transmit(uint8_t *data, uint16_t len);

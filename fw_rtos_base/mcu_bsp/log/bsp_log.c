@@ -95,6 +95,16 @@ void bsp_log_init(void)
  * @param tag   模块名（可为 NULL，输出 "-"）
  * @param fmt   格式化串
  */
+/* CLI 原始输出：无时间戳无标签，直接把字节塞进发送环形缓冲 */
+void log_raw(const char *str, uint16_t len)
+{
+    if ((str == NULL) || (len == 0U))
+    {
+        return;
+    }
+    debug_transmit((uint8_t *)str, len);
+}
+
 void log_out(uint8_t level, const char *tag, const char *fmt, ...)
 {
     if ((fmt == NULL) || (level > LOG_LEVEL_DEBUG) || (level == LOG_LEVEL_NONE))
@@ -198,11 +208,23 @@ void debug_transmit(uint8_t *data, uint16_t len)
     log_exit_critical(saved);
 
     /* 唤醒日志任务消费：调度器启动前不发通知（避免启动前调用任务级 FreeRTOS
-     * API），积压数据由日志任务启动后的首轮冲刷兜底。 */
+     * API），积压数据由日志任务启动后的首轮冲刷兜底。
+     * 【死锁修复 2026-08-21】中断上下文必须用 FromISR 版通知：此前 CLI RX 诊断
+     * 在 IDLE 中断里调 log_raw→debug_transmit→任务级 xTaskNotifyGive，内核状态
+     * 损坏致系统僵死（用户发第一个 ls 即全僵）。现按 IPSR 区分上下文。 */
     if ((s_log_task_handle != NULL) &&
         (xTaskGetSchedulerState() != taskSCHEDULER_NOT_STARTED))
     {
-        xTaskNotifyGive(s_log_task_handle);
+        if ((__get_IPSR() & 0xFFU) != 0U)
+        {
+            BaseType_t xw = pdFALSE;
+            vTaskNotifyGiveFromISR(s_log_task_handle, &xw);
+            portYIELD_FROM_ISR(xw);
+        }
+        else
+        {
+            xTaskNotifyGive(s_log_task_handle);
+        }
     }
 }
 

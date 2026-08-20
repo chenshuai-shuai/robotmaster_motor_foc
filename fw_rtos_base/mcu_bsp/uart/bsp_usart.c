@@ -1,5 +1,6 @@
 #include "bsp_usart.h"
 #include "stdlib.h"
+#include <stdio.h>
 #include "string.h"
 
 /* usart service instance, modules' info would be recoreded here using USARTRegister() */
@@ -81,6 +82,9 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     for (uint8_t i = 0; i < idx; ++i) {                 // find the instance which is being handled
         if (huart == usart_instance[i]->usart_handle) { // call the callback function if it is not NULL
             if (usart_instance[i]->module_callback != NULL) {
+                /* 【死锁修复 2026-08-21】此处不得放日志（中断上下文 snprintf/log_raw
+                 * 触发任务级 xTaskNotifyGive 死锁）。接收诊断改用回调内的 g_sd_step
+                 * 或任务上下文打印。 */
                 usart_instance[i]->module_callback();
                 memset(usart_instance[i]->recv_buff, 0, Size); // 接收结束后清空buffer,对于变长数据是必要的
             }

@@ -99,6 +99,7 @@ static void sdcard_task(void *arg)
 
                 /* 读写任务：写 test.txt → 读回 → 校验（结果上 OLED + 日志） */
                 SYS_SetState(SYS_STATE_SD_MOUNT);
+                vTaskDelay(pdMS_TO_TICKS(500U));  /* 稳定期：让启动日志排空，写路径独占系统 */
                 LOG_I("SdCard", "RW TEST: writing test.txt & verifying...");
                 uint32_t rb = 0U;
                 int rw = SD_FS_RWTest(&rb);
