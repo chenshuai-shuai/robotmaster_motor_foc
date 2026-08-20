@@ -37,47 +37,56 @@
 #define CLI_LINE_MAX      96U     /* 单条命令行最大长度 */
 #define CLI_ARGS_MAX      8U      /* 命令参数上限 */
 
-/* ---- 双缓冲行收集（中断写 / 任务读，互不阻塞） ---- */
-static uint8_t  s_rx_buf[2][CLI_LINE_MAX];
-static volatile uint8_t  s_rx_active = 0U;   /* 中断当前写入的缓冲索引 */
-static volatile uint16_t s_rx_len = 0U;      /* 当前写入缓冲的已收字节数 */
-static volatile uint8_t  s_line_ready = 0U;  /* 0=空闲 1=有完整行待处理 */
+/* ---- 接收字节环形队列（中断只入队，任务消费——中断最小化铁律） ---- */
+#define CLI_RXQ_SIZE      256U              /* 2 的幂 */
+static volatile uint8_t  s_rxq[CLI_RXQ_SIZE];
+static volatile uint16_t s_rxq_wr = 0U;     /* 中断写指针 */
+static volatile uint16_t s_rxq_rd = 0U;     /* 任务读指针 */
+static volatile uint16_t s_rxq_cnt = 0U;    /* 队列字节数（诊断） */
+static volatile uint16_t s_last_byte = 0U;  /* 最后收到的字节（诊断） */
 static TaskHandle_t s_cli_task = NULL;
 
 extern USARTInstance uart10;
 
 /* ---- 回调（HAL UART IDLE/DMA 中断上下文） ----
- * 语义：一次 IDLE = 一帧 = 一条命令（Serial Monitor 整条发送触发一次 IDLE）。
- * 不依赖换行符：过滤 \r\n 后整帧即命令，兼容带/不带换行的发送。 */
+ * 【中断最小化铁律】只做一件事：字节入环形队列。
+ * 零输出、零行处理、零任务通知——回显/行编辑/命令执行全部在任务里。
+ * （历史教训：中断里 log_raw 回显+通知+处理 交织，出现提示符风暴与
+ *  接收死寂——2026-08-21 v0.1.35 现场） */
 static void cli_rx_callback(void)
 {
-    uint8_t *dst = s_rx_buf[s_rx_active];
-    uint16_t n = uart10.recv_buff_size;
-    uint16_t len = 0U;
+    /* 关键：只处理本次实际收到的字节。HAL 在 RxEventCallback 前置 RxXferCount；
+     * IDLE 空触发（接收重启后线路空闲再触发）时 RxXferCount=0——若像以前遍历
+     * 整个 recv_buff 会把残留旧字节重复入队（0D 风暴/丢字符根因，2026-08-21）。 */
+    uint16_t n = (uint16_t)uart10.usart_handle->RxXferCount;
+    if (n == 0U)
+    {
+        return;   /* IDLE 空触发，无新数据 */
+    }
 
     for (uint16_t i = 0U; i < n; i++)
     {
         uint8_t c = uart10.recv_buff[i];
-        if ((c == '\r') || (c == '\n') || (c == '\0'))
+        if (c == '\0')
         {
-            continue;   /* 跳过换行与填充零 */
+            break;   /* 数据区结束 */
         }
-        if (len < (CLI_LINE_MAX - 1U))
+        s_rxq[s_rxq_wr] = c;
+        s_rxq_wr = (s_rxq_wr + 1U) & (CLI_RXQ_SIZE - 1U);
+        if (s_rxq_cnt < CLI_RXQ_SIZE)
         {
-            dst[len++] = c;
+            s_rxq_cnt++;
         }
-    }
-
-    if (len > 0U)
-    {
-        dst[len] = '\0';
-        s_rx_len = len;
-        s_rx_active ^= 1U;   /* 切换缓冲：任务读旧缓冲，中断写新缓冲 */
+        else
+        {
+            s_rxq_rd = (s_rxq_rd + 1U) & (CLI_RXQ_SIZE - 1U);  /* 满则丢最旧 */
+        }
+        s_last_byte = c;
         if (s_cli_task != NULL)
         {
             BaseType_t xw = pdFALSE;
             vTaskNotifyGiveFromISR(s_cli_task, &xw);
-            (void)xw;
+            portYIELD_FROM_ISR(xw);
         }
     }
 }
@@ -90,7 +99,7 @@ static void cli_echo(const char *s)
 
 static void cli_prompt(void)
 {
-    cli_echo("\r\nSTM32> ");
+    cli_echo("STM32> ");   /* 无前导换行：紧跟上一行输出（Linux 风格） */
 }
 
 static void cli_print_fr(const char *op, const char *path, FRESULT fr)
@@ -369,6 +378,7 @@ void SD_CLI_TaskEntry(void *arg)
     (void)arg;
     s_cli_task = xTaskGetCurrentTaskHandle();
     char line[CLI_LINE_MAX];
+    uint16_t line_len = 0U;
 
     /* SD 初始化裕量：卡就绪前 CLI 不激活，绝不与 SD 初始化/RW 测试抢时序 */
     LOG_I("cli", "waiting for SD ready before activating...");
@@ -382,31 +392,44 @@ void SD_CLI_TaskEntry(void *arg)
 
     for (;;)
     {
-        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+        /* 等字节入队通知或 100ms 超时（防通知丢失兜底） */
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(100U));
 
-        /* 取就绪帧：中断已切走 active（写另一缓冲），本帧数据在旧缓冲 */
-        uint16_t len;
-        uint8_t idx;
-        taskENTER_CRITICAL();
-        idx = s_rx_active ^ 1U;
-        len = s_rx_len;
-        s_rx_len = 0U;
-        taskEXIT_CRITICAL();
-
-        if (len == 0U)
+        /* 出队并逐字节处理：回显 + 行累积 + 退格 + 回车执行（全部在任务上下文） */
+        while (s_rxq_cnt > 0U)
         {
-            cli_prompt();
-            continue;
+            uint8_t c;
+            taskENTER_CRITICAL();
+            c = s_rxq[s_rxq_rd];
+            s_rxq_rd = (s_rxq_rd + 1U) & (CLI_RXQ_SIZE - 1U);
+            s_rxq_cnt--;
+            taskEXIT_CRITICAL();
+
+            if ((c == '\r') || (c == '\n'))
+            {
+                log_raw("\r\n", 2U);
+                if (line_len > 0U)
+                {
+                    line[line_len] = '\0';
+                    cli_process_line(line);
+                    line_len = 0U;
+                }
+                cli_prompt();   /* 空回车也重新显示提示符 */
+            }
+            else if ((c == 0x08U) || (c == 0x7FU))
+            {
+                if (line_len > 0U)
+                {
+                    line_len--;
+                    log_raw("\b \b", 3U);
+                }
+            }
+            else if (line_len < (CLI_LINE_MAX - 1U))
+            {
+                line[line_len++] = (char)c;
+                log_raw((const char *)&c, 1U);   /* 字符回显 */
+            }
         }
-
-        memcpy(line, s_rx_buf[idx], len);
-        line[len] = '\0';
-
-        cli_process_line(line);
-
-        /* 清行缓冲防串扰 */
-        memset(s_rx_buf[idx], 0, CLI_LINE_MAX);
-        cli_prompt();
     }
 }
 
