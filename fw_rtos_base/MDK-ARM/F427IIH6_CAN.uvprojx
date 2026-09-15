@@ -341,7 +341,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F427xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Task/Inc;../Device/Inc;../mcu_bsp/can;../mcu_bsp/Motor;../mcu_bsp/button;../mcu_bsp/protocol;../mcu_bsp/protocol_calibration;../mcu_bsp/uart;../mcu_bsp/log;../mcu_bsp/oled;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Middlewares/Third_Party/FatFs/src;../Middlewares/Third_Party/FatFs/src/option;../mcu_bsp/sd;../mcu_bsp/fs;../mcu_bsp/version;../mcu_bsp/sys_status;../mcu_bsp/cli</IncludePath>
+              <IncludePath>../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Task/Inc;../Device/Inc;../mcu_bsp/can;../mcu_bsp/Motor;../mcu_bsp/button;../mcu_bsp/key;../mcu_bsp/protocol;../mcu_bsp/protocol_calibration;../mcu_bsp/uart;../mcu_bsp/log;../mcu_bsp/oled;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Middlewares/Third_Party/FatFs/src;../Middlewares/Third_Party/FatFs/src/option;../mcu_bsp/sd;../mcu_bsp/fs;../mcu_bsp/version;../mcu_bsp/sys_status;../mcu_bsp/cli</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -1065,6 +1065,11 @@
               <FilePath>..\Task\Src\MotorTest_Task.c</FilePath>
             </File>
             <File>
+              <FileName>J8108_Task.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Task\Src\J8108_Task.c</FilePath>
+            </File>
+            <File>
               <FileName>Led_Task.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Task\Src\Led_Task.c</FilePath>
@@ -1108,6 +1113,21 @@
               <FileName>dm_j4310.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\mcu_bsp\Motor\dm_j4310.c</FilePath>
+            </File>
+            <File>
+              <FileName>motor_8108.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\mcu_bsp\Motor\motor_8108.c</FilePath>
+            </File>
+            <File>
+              <FileName>bsp_key.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\mcu_bsp\key\bsp_key.c</FilePath>
+            </File>
+            <File>
+              <FileName>key_core.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\mcu_bsp\key\key_core.c</FilePath>
             </File>
             <File>
               <FileName>c620.c</FileName>

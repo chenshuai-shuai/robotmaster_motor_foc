@@ -20,7 +20,7 @@ static uint8_t idx; // 全局CAN实例索引,每次有新的模块注册会自�
  */
 static void CANAddFilter(CANInstance *_instance)
 {
-    CAN_FilterTypeDef can_filter_conf;
+    CAN_FilterTypeDef can_filter_conf = {0}; /* 2026-09-15 修正：原结构体未清零，HAL 会把栈上随机值写入 FilterIdHigh/掩码字段。清零后掩码=0（过滤层全通过），精确匹配由软件层(rx_id)完成 */
     static uint8_t can1_filter_idx = 0, can2_filter_idx = 14; // 0-13给can1用,14-27给can2用
 
     can_filter_conf.FilterMode = CAN_FILTERMODE_IDMASK;                                                       // 使用id mask模式,即通过掩码过滤接收的报文

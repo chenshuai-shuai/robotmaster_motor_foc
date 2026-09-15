@@ -8,6 +8,8 @@
 
 /* ---- 小车项目：单电机测试任务（M2006+C610�?---- */
 #include "MotorTest_Task.h"
+#include "J8108_Task.h"
+#include "bsp_key.h"   /* onboard user key PB2: click / double / hold */   /* 8108 joint-motor bring-up (bench debug) */
 #include "bsp_usart.h"
 extern "C" void UART10_Init(void);
 
@@ -63,7 +65,11 @@ void main_cpp(void)
   /* ---- 小车项目：日志串�?+ 单电机测试任�?----
    * 注意：先跑通单电机（开环电流斜坡），再扩展 4 电机�?   * CubeMX 需启用 USART6（或�?uart10_def.c 里的句柄）作为日志口�?   */
   UART10_Init();
-  MotorTest_Task_Init();
+  /* 8108 joint-motor bring-up test (2026-09-15): car MotorTest paused for bench debug.
+     To restore car test: swap the two Init calls below. */
+  // MotorTest_Task_Init();
+  /* M1: J8108_Task_Init()/Key_Task_Init() moved to Core/Src/main.c
+     (main_cpp() is NOT called while FEATURE_CAR_TASKS=0; keep single creation point). */
 }
 
 void Onmain_Task(void *pvParameters)

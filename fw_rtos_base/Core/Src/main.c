@@ -39,6 +39,9 @@
 #include "bsp_log.h"
 #include "sys_status.h"
 #include "sd_cli.h"
+#include "feature_config.h"   /* 功能开关（宏裁剪无关功能） */
+#include "J8108_Task.h"       /* 8108 关节电机任务（CAN1） */
+#include "bsp_key.h"          /* 板载按键 PB2 事件机 */
 extern void UART10_Init(void);
 /* USER CODE END Includes */
 
@@ -131,14 +134,41 @@ int main(void)
   // main_cpp();          /* 阶段1停用：舵机+遥控任务 */
   // MotorTest_Task_Init();/* 阶段1停用：单电机测试 */
   UART10_Init();            /* 日志串口必须先于 LED 任务（任务里 printf 依赖 uart10） */
-  SD_CLI_Init();             /* SD 卡命令行（uart10 接收回调注册） */
   LOG_I("fw", "=== firmware %s (release %s, built %s %s) ===",
         FW_VERSION_STR, FW_RELEASE_STR, FW_BUILD_DATE, FW_BUILD_TIME);  /* 双版本标识 */
+  LOG_I("fw", "features: J8108=%u KEY=%u OLED=%u LED=%u | SD=%u CLI=%u CAR=%u | verbose_log=%u",
+        FEATURE_J8108, FEATURE_KEY, FEATURE_OLED_UI, FEATURE_LED_TASK,
+        FEATURE_SD_CARD, FEATURE_SD_CLI, FEATURE_CAR_TASKS, FEATURE_VERBOSE_LOG);
+
+#if FEATURE_SD_CLI
+  SD_CLI_Init();             /* SD 卡命令行（uart10 接收回调注册） */
+#endif
+#if FEATURE_LED_TASK
   Led_Task_Init();          /* LED 流水灯任务 */
+#endif
+#if FEATURE_OLED_UI
   OLED_Init();              /* OLED 显示屏（软件I2C：PB10=SCL/PB9=SDA，地址0x78） */
-  Oled_Task_Init();      /* 状态屏任务（二分法排查结束，恢复） */
+  Oled_Task_Init();         /* 单页监护界面任务 */
+#endif
+#if FEATURE_SD_CARD
   SdCard_Task_Init();
+#endif
+#if FEATURE_SD_CLI
   xTaskCreate(SD_CLI_TaskEntry, "CliTask", 512, NULL, 3, NULL);  /* SD 命令行任务 */
+#endif
+#if FEATURE_J8108
+  J8108_Task_Init();        /* 8108 关节电机（CAN1；默认仅监听，不发帧） */
+#endif
+#if FEATURE_KEY
+  Key_Task_Init();          /* 板载按键 PB2（10ms 扫描 + 事件机） */
+#endif
+#if FEATURE_CAR_TASKS
+  main_cpp();               /* 小车：舵机 + 遥控（默认关闭） */
+#endif
+
+  /* 任务创建结果自检（heap 32KB 紧张：创建失败会静默不跑 → 这里显式报出来 + 打印剩余堆） */
+  LOG_I("fw", "task bring-up: active=%u | free heap=%u B / total=%u B (task+stack+TCB 已占用)",
+        (unsigned)uxTaskGetNumberOfTasks(), (unsigned)xPortGetFreeHeapSize(), (unsigned)configTOTAL_HEAP_SIZE);
   SYS_SetState(SYS_STATE_RUNNING);         /* OLED 显示任务：画面绘制/周期刷新由任务执行 */
 //	HAL_TIM_PWM_Start(&htim4,TIM_CHANNEL_1);
 //	int debug_pwm=0;
