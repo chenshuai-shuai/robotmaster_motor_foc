@@ -495,7 +495,7 @@ def static_checks():
     _seg = mainc[mainc.index("#if FEATURE_J8108"):mainc.index("#if FEATURE_SERIAL_CTRL")]
     check("main.c: CmdRx_Task_Init 只由 SERIAL_CTRL 门控（J8108 块已闭合，不再嵌套）",
           "#endif" in _seg and "CmdRx_Task_Init" not in _seg)
-    # ---- M2：依赖收口（隐藏依赖不许复活；见 docs/日志_模块化改造.md M2）----
+    # ---- M2：依赖收口（隐藏依赖不许复活；见 docs/3_过程记录/日志_模块化改造.md M2）----
     _cx = read(os.path.join(BASE, "Task", "Src", "CmdRx_Task.c"))
     _jt = read(os.path.join(BASE, "Task", "Src", "J8108_Task.c"))
     check("M2: #TEL 在无监控任务时回 @ERR 4（不许假 @OK —— 回包必须与行为一致）",
@@ -544,7 +544,7 @@ def static_checks():
           "#warning" not in _fc_cfg and "#warning" in mainc and "!FEATURE_J8108" in mainc)
     # ---- M4：模块自检 #ST ----
     _cp4 = read(os.path.join(BASE, "mcu_bsp", "proto", "cmd_parse.h"))
-    _man4 = read(os.path.join(BASE, "docs", "操作手册_串口命令.md"))
+    _man4 = read(os.path.join(BASE, "docs", "1_规则（既定事实）/操作手册_串口命令.md"))
     _cmd4 = read(os.path.join(BASE, "Task", "Src", "CmdRx_Task.c"))
     check("M4: #ST 进了解析表且手册有对应行", '"ST"' in _cp4 and "#ST" in _man4)
     M4_ST = {
@@ -757,7 +757,7 @@ def static_checks():
     check("串口: 有原始字节计数 + 前 3 行原样打印（联调诊断）",
           "s_rx_bytes" in cx2 and "CmdRx_RxBytes" in cx2 and "rx line %u" in cx2)
     # ---- 操作手册 ↔ 实现一致性（防文档漂移：改了命令/回包就必须同步改手册）----
-    man = read(os.path.join(BASE, "docs", "操作手册_串口命令.md"))
+    man = read(os.path.join(BASE, "docs", "1_规则（既定事实）/操作手册_串口命令.md"))
     CMDNAMES = ["PING", "VER", "STAT", "LOG", "CLR", "SET", "GET", "EN", "DIS", "STOP", "ESTOP", "ZERO", "MODE",
                 "DAMP", "V", "P", "T", "IMP", "HOLD", "SETP", "LIM", "RATE", "WD", "TEL", "HELP"]
     per_parse = [n for n in CMDNAMES if f'"{n}"' not in cp]

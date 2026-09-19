@@ -45,7 +45,7 @@ BLOCKS = {
         "files": ["tools/serial_bench.py"],
         "params": [["115200 8N1", "串口参数"], ["#CMD", "命令前缀"], ["@OK/@ERR/@EVT/@TEL", "回包前缀"]],
         "pitfalls": ["不发换行 → A 板只收到字节不成行，没有任何回包（老坑）"],
-        "doc": "操作手册_串口命令.md §1（30 秒上手）",
+        "doc": "1_规则（既定事实）/操作手册_串口命令.md §1（30 秒上手）",
     },
     "uart": {
         "title": "② USART6 + DMA + IDLE",

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""serial_bench.py - 8108 串口控制台架自测（配套 docs/测试手册_8108串口控制.md）
+"""serial_bench.py - 8108 串口控制台架自测（配套 docs/1_规则（既定事实）/测试手册_8108串口控制.md）
 
 用法：
   python tools/serial_bench.py --port COM3 --smoke        # L0/L2 层冒烟（**不需要电机上电**，安全）
