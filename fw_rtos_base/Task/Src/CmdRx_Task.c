@@ -28,7 +28,7 @@
 #include "Monitor_Task.h"
 #include "ui_status.h"
 #include "Led_Task.h"     /* #ST led  自检 */
-#include "Oled_Task.h"    /* #ST disp 自检 */
+#include "disp_port.h"    /* #ST disp 自检：Disp_SelfTest()（屏抽象层，单色/彩屏驱动各自实现） */
 #include "bsp_key.h"      /* #ST key  自检 */
 #include "version.h"
 #include "feature_config.h"
@@ -149,7 +149,7 @@ static void first_token(const char *line, uint16_t len, char *out, uint16_t outs
 #define ST_FAIL (3u)
 
 #if FEATURE_DISP_UI
-static uint8_t st_disp(void) { return Oled_SelfTest(); }
+static uint8_t st_disp(void) { return Disp_SelfTest(); }
 #else
 static uint8_t st_disp(void) { return 0u; } /* 未编译 */
 #endif

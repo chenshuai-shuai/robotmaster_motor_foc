@@ -32,7 +32,8 @@
 #include "math.h"
 #include "Led_Task.h"
 #include "bsp_usart.h"
-#include "OLED.h"
+#include "disp_port.h"       /* 屏幕抽象层契约（具体屏由 feature_config.h §4 二选一） */
+#include "Disp_Task.h"       /* 显示自检任务：屏的上电/初始化/体检都放任务里跑（不卡调度器启动） */
 #include "Oled_Task.h"
 #include "SdCard_Task.h"
 #include "version.h"
@@ -177,7 +178,8 @@ int main(void)
   Led_Task_Init();          /* LED 流水灯任务 */
 #endif
 #if FEATURE_DISP_UI
-  OLED_Init();              /* OLED 显示屏（软件I2C：PB10=SCL/PB9=SDA，地址0x78） */
+  Disp_Init();              /* 屏：只配引脚+SPI（毫秒级；长延时/自检见 Disp_Task.c） */
+  Disp_Task_Init();         /* 屏的上电/初始化/体检交给低优先级任务，不卡调度器启动 */
 #if FEATURE_MONITOR_TASK
   Monitor_Task_Init();      /* 低频监控任务：屏刷 10Hz + 日志 1Hz + 遥测（三层同源快照） */
 #endif

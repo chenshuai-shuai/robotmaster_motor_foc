@@ -33,7 +33,7 @@ fw_rtos_base/
 ├── F427IIH6_CAN.ioc        ← CubeMX 工程（改配置从这里）
 ├── Core/                   ← 生成代码（HAL 初始化、main、中断）
 ├── Task/                   ← ★ 我们自己的任务（J8108_Task、CmdRx_Task、Monitor_Task、Oled_Task、Led_Task）
-├── mcu_bsp/                ← 板级驱动（ctrl 控制核 / proto 协议 / Motor 8108 / can / uart / oled / key / log / sys_status）
+├── mcu_bsp/                ← 板级驱动（ctrl 控制核 / proto 协议 / Motor 8108 / can / uart / **disp 屏幕抽象层** / oled / key / log / sys_status）
 ├── docs/                   ← ★ 文档（code/ 为代码详解与流程图）
 ├── tools/                  ← verify_dev.py 核验 · serial_bench.py 台架 · check_code_docs.py 文档体检 · gen_flow_html.py
 ├── Device/                 ← 原作者舵机等（阶段1停用）
@@ -62,6 +62,21 @@ fw_rtos_base/
 | USB | OTG_FS Device_Only，CDC 类，48MHz 来自 PLLQ=7 |
 | FreeRTOS | 静态 Idle + heap_4 动态（15KB），tick 1kHz |
 | printf | fputc → USART6（重定向在 mcu_bsp/log/bsp_log.c） |
+
+## 屏幕（v0.1.67 起：抽象层 + 两块屏）
+
+页面逻辑（`Task/Src/Oled_Task.c` 的 4 页）只调 `mcu_bsp/disp/disp_port.h` 的 `Disp_*`，**换屏不改页面**（门禁 V2 断言）。
+选哪块屏 = `Task/Inc/feature_config.h` **§4 两行宏**（恰好一个为 1）：
+
+| 屏 | 宏 | 接线（A 板 OLED 口 7P） |
+|---|---|---|
+| 1.3" SH1106 单色 128×64（现役） | `FEATURE_DISP_SH1106_I2C 1u` / `..._ST7735S_SPI 0u` | PB10=SCL、PB9=SDA（软 I2C） |
+| 1.8" ST7735S 彩屏 128×160 | 两个值**对调** | PB3=SCK、PA7=MOSI、PA6=SDO、PB9=RS、PB10=CS（低=LCD/高=字库） |
+
+换屏流程：改 §4 两行 → `PYTHONPATH= /c/msys64/usr/bin/make profiles`（驱动变体扫描 + 契约头检查）→ 重编重烧 →
+开机看 `@BOOT ... disp=SH1106-I2C|ST7735S-SPI` 与 `[disp] I: <型号> <w>x<h> selftest=<n> flush=<us>us` 确认烧的是哪块屏。
+彩屏上电会先亮 **1.5s 自检画面**（边框四边等宽=偏移对；四角色块+三色条=颜色对），随后被 Monitor 第 0 页覆盖。
+判据与排查见 `docs/1_规则（既定事实）/测试手册_8108串口控制.md` 的 **TM-D1~TM-D5**；分层与坑见 `docs/code/06_显示按键与监控.md` §10。
 
 ## 电机相关（阶段2）
 

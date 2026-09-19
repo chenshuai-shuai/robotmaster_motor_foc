@@ -26,7 +26,10 @@
 #define PROFILE_MINIMAL   4u /* 板级 bring-up：只有串口日志 + LED */
 
 #ifndef CFG_PROFILE
-#define CFG_PROFILE PROFILE_FULL
+/* ★★ 当前默认组合（编译下载的就是这个）★★
+ * 彩屏阶段 = PROFILE_DISP_DEV（有屏无电机）：电机模块整体不参与编译，不抢时基。
+ * 彩屏整合完成后改回 PROFILE_FULL 即交付版。开机会在 @BOOT 横幅自报组合名。 */
+#define CFG_PROFILE PROFILE_DISP_DEV
 #endif
 
 /* ==================== 2. 功能宏（由 profile 展开；勿手工改） ==================== */
@@ -74,10 +77,17 @@
 #define FEATURE_CAR_TASKS 0u /* 小车：舵机 + 遥控 + main_cpp() */
 
 /* ==================== 4. 显示驱动选择（硬件相关，不随 profile 变） ==================== */
-/* 两块屏共用 A 板 OLED 口（7P）的同一组引脚 → 同一时刻只能开一个 */
+/* 两块屏共用 A 板 OLED 口（7P）的同一组引脚 → 同一时刻只能开一个。
+ * ★ 这两个宏允许命令行 -D 覆盖（道理同 CFG_PROFILE）：屏是**硬件选择**，不属于任何 profile，
+ *   组合矩阵默认永远编不到"没被选中那个驱动"的函数体 → tools/check_profiles.py 专门用
+ *   -DFEATURE_DISP_ST7735S_SPI=1 -DFEATURE_DISP_SH1106_I2C=0 过一遍彩屏驱动（S2 烧板前必跑）。 */
 
-#define FEATURE_DISP_SH1106_I2C  1u /* 现役：1.3" SH1106 软 I2C（PB10=SCL / PB9=SDA） */
-#define FEATURE_DISP_ST7735S_SPI 0u /* 待接：1.8" ST7735S 彩屏（PB3=SCK PA7=MOSI PB9=RS PB10=CS PA6=SDO） */
+#ifndef FEATURE_DISP_SH1106_I2C
+#define FEATURE_DISP_SH1106_I2C  0u /* 备用：1.3" SH1106 软 I2C（PB10=SCL / PB9=SDA） */
+#endif
+#ifndef FEATURE_DISP_ST7735S_SPI
+#define FEATURE_DISP_ST7735S_SPI 1u /* ★ 现役（2026-09-19 起）：1.8" ST7735S 彩屏 128x160（PB3=SCK PA7=MOSI PB9=RS PB10=CS PA6=SDO） */
+#endif
 
 #if FEATURE_DISP_ST7735S_SPI
 #define DISP_DRIVER_NAME "ST7735S-SPI"
@@ -86,6 +96,10 @@
 #else
 #define DISP_DRIVER_NAME "none"
 #endif
+
+/* 派生开关：内置 ASCII 点阵（mcu_bsp/oled/OLED_Data.c）被**两个驱动共用** —— 任一驱动在就有用。
+ * 少了它，选中彩屏时 OLED_Data.c 会被 SH1106 的宏编成空对象 → 驱动 B 链接期找不到字模。 */
+#define FEATURE_DISP_FONTS (((FEATURE_DISP_SH1106_I2C) != 0u) || ((FEATURE_DISP_ST7735S_SPI) != 0u))
 
 /* ==================== 5. 日志详略 ==================== */
 
@@ -105,10 +119,8 @@
 #if FEATURE_MONITOR_TASK && !FEATURE_KEY
 #error "FEATURE_MONITOR_TASK requires FEATURE_KEY (4 页界面靠板载按键翻页，没有按键就没有 UI 输入)"
 #endif
-/* ★ 临时规则（显示 S1 落地后删除）：彩屏驱动尚未实现，现在打开它只会在链接期报错 → 提前拦住 */
-#if FEATURE_DISP_ST7735S_SPI
-#error "ST7735S driver not implemented yet (comes with display step S1: disp_port.h + disp_st7735s_spi.c)"
-#endif
+/* ★ 临时规则已于 2026-09-19 删除（S1/S2 落地）：disp_port.h 契约 + 两个驱动
+ *   (disp_sh1106_i2c.c / disp_st7735s_spi.c) 都在 mcu_bsp/disp/，选中哪个宏就编哪个。 */
 #if FEATURE_SD_CLI && !FEATURE_SD_CARD
 #error "FEATURE_SD_CLI requires FEATURE_SD_CARD"
 #endif

@@ -2,7 +2,7 @@
 #include "feature_config.h"   /* M3：文件级隔离需要一个统一的开关 */
 
 
-#if FEATURE_DISP_SH1106_I2C
+#if FEATURE_DISP_FONTS
 /* M3 文件级隔离（docs/规范_功能宏与模块化.md R3）：未启用时本文件编译为空对象。
  * 被谁调用必须由调用点用同一个宏保护（忘保护=链接失败，这是刻意设计的 fail-fast）。 */
 
@@ -488,4 +488,4 @@ const uint8_t luoxiaohei[] = {
 /*****************江协科技|版权所有****************/
 /*****************jiangxiekeji.com*****************/
 
-#endif /* FEATURE_DISP_SH1106_I2C */
+#endif /* FEATURE_DISP_FONTS */

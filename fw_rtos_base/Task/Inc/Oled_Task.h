@@ -14,7 +14,7 @@
 /* 按页绘制（page 越界 → 画 P0）；内部做局部刷新，无变化不发 I2C */
 void Oled_UiDraw(uint8_t page, const J8108_Snapshot_t *sn, const Ui_Status_t *ui);
 
-/* 模块自检（非破坏性，只读）：0=未编译 1=OK 2=WARN（最近没在刷） 3=FAIL */
-uint8_t Oled_SelfTest(void);
+/* 模块自检已上移到屏抽象层：#ST disp → Disp_SelfTest()（见 mcu_bsp/disp/disp_port.h）；
+ * 页面层不再有自己的自检 —— 屏刷心跳由驱动在 Disp_Flush() 里维护。 */
 
 #endif /* OLED_TASK_H */

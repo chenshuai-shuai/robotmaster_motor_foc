@@ -18,6 +18,7 @@
 
 #include "bsp_log.h"
 #include "stack_probe.h" /* 栈余量自报 */
+#include "disp_port.h"   /* Disp_LastFlushUs：10s 摘要里的屏刷耗时（TM-D2 判据） */
 #include "motor_8108.h"
 #include "ctrl_core.h"
 #include "ui_action.h"
@@ -284,6 +285,12 @@ static void monitor_task(void *arg)
         if ((uint32_t)(t - t_last_sum) >= (uint32_t)MON_SUM_MS)
         {
             t_last_sum = t;
+            /* 屏刷耗时 + 推屏次数单独一行（TM-D2 判据）：不并进 summary 行 —— 那行已经接近
+             * LOG_FMT_BUF_SIZE(128) 的截断线，塞在末尾正好会被截掉（M1 实测的坑）。
+             * **pushes= 是必需的**：画面静止时 flush= 数值会一直不变（不推屏），
+             * 只有对比两次的 pushes 增量才能区分"没变化（正常）"与"推屏停了（故障）"。 */
+            LOG_I("disp", "flush=%luus pushes=%lu", (unsigned long)Disp_LastFlushUs(),
+                  (unsigned long)Disp_PushCount());
             if (fresh != 0u)
             {
                 LOG_I("Monitor", "summary: link=UP mode=%s en=%u rx=%lu tx=%lu hz=%u uptime=%lus heap=%lu txdrop=%lu dtmax=%lums",

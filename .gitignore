@@ -41,6 +41,10 @@ fw_rtos_base/Temp_*.json
 # 外部参考资料（厂商例程/驱动源码包/编译产物）：属于调研素材，不进固件版本库
 外部参考资料/
 .vscode/*.lock
+# Python 缓存（门禁/工具脚本跑一次就会生成，勿入库）
+__pycache__/
+*.pyc
+
 # 清理备份区
 _stray_backup_*/
 # 根目录防护（防 CubeMX 再生成到根目录）
@@ -53,3 +57,5 @@ _stray_backup_*/
 /*.uvguix*
 /*.scvd
 /startup_stm32f427xx.s
+fw_rtos_base/MDK-ARM/_profile_build/
+fw_rtos_base/MDK-ARM/_profile_*.uvprojx

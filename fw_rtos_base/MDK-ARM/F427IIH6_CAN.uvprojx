@@ -341,7 +341,7 @@
               <MiscControls></MiscControls>
               <Define>USE_HAL_DRIVER,STM32F427xx</Define>
               <Undefine></Undefine>
-              <IncludePath>../mcu_bsp/ctrl;../mcu_bsp/proto;../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Task/Inc;../Device/Inc;../mcu_bsp/can;../mcu_bsp/Motor;../mcu_bsp/button;../mcu_bsp/key;../mcu_bsp/protocol;../mcu_bsp/protocol_calibration;../mcu_bsp/uart;../mcu_bsp/log;../mcu_bsp/oled;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Middlewares/Third_Party/FatFs/src;../Middlewares/Third_Party/FatFs/src/option;../mcu_bsp/sd;../mcu_bsp/fs;../mcu_bsp/version;../mcu_bsp/sys_status;../mcu_bsp/cli</IncludePath>
+              <IncludePath>../mcu_bsp/ctrl;../mcu_bsp/proto;../Core/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc;../Drivers/STM32F4xx_HAL_Driver/Inc/Legacy;../Drivers/CMSIS/Device/ST/STM32F4xx/Include;../Drivers/CMSIS/Include;../Task/Inc;../Device/Inc;../mcu_bsp/can;../mcu_bsp/Motor;../mcu_bsp/button;../mcu_bsp/key;../mcu_bsp/protocol;../mcu_bsp/protocol_calibration;../mcu_bsp/uart;../mcu_bsp/log;../mcu_bsp/oled;../Middlewares/Third_Party/FreeRTOS/Source/include;../Middlewares/Third_Party/FreeRTOS/Source/CMSIS_RTOS;../Middlewares/Third_Party/FreeRTOS/Source/portable/GCC/ARM_CM4F;../Middlewares/Third_Party/FatFs/src;../Middlewares/Third_Party/FatFs/src/option;../mcu_bsp/sd;../mcu_bsp/fs;../mcu_bsp/version;../mcu_bsp/sys_status;../mcu_bsp/cli;../mcu_bsp/disp</IncludePath>
             </VariousControls>
           </Cads>
           <Aads>
@@ -1004,6 +1004,11 @@
                 </FileArmAds>
               </FileOption>
             </File>
+            <File>
+              <FileName>stm32f4xx_hal_spi.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_spi.c</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
@@ -1088,6 +1093,11 @@
               <FileName>Monitor_Task.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\Task\Src\Monitor_Task.c</FilePath>
+            </File>
+            <File>
+              <FileName>Disp_Task.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\Task\Src\Disp_Task.c</FilePath>
             </File>
           </Files>
         </Group>
@@ -1198,6 +1208,21 @@
               <FileName>crc8.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\mcu_bsp\protocol_calibration\crc8.c</FilePath>
+            </File>
+            <File>
+              <FileName>disp_geom.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\mcu_bsp\disp\disp_geom.c</FilePath>
+            </File>
+            <File>
+              <FileName>disp_sh1106_i2c.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\mcu_bsp\disp\disp_sh1106_i2c.c</FilePath>
+            </File>
+            <File>
+              <FileName>disp_st7735s_spi.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\mcu_bsp\disp\disp_st7735s_spi.c</FilePath>
             </File>
           </Files>
         </Group>
