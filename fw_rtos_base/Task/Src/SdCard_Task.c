@@ -19,6 +19,12 @@
 extern volatile int g_rw_result;
 #include "sd_sdio.h"
 #include "sd_fs.h"
+#include "feature_config.h"   /* M3：文件级隔离需要一个统一的开关 */
+
+
+#if FEATURE_SD_CARD
+/* M3 文件级隔离（docs/规范_功能宏与模块化.md R3）：未启用时本文件编译为空对象。
+ * 被谁调用必须由调用点用同一个宏保护（忘保护=链接失败，这是刻意设计的 fail-fast）。 */
 
 /* ---- 任务参数（集中配置） ---- */
 #define SDCARD_TASK_PRIORITY    3U    /* 低于 Led(5)/Oled(4)，高于日志(1) */
@@ -144,3 +150,5 @@ void SdCard_Task_Init(void)
     xTaskCreate(sdcard_task, "SdCard", SDCARD_TASK_STACK_WORDS, NULL,
                 SDCARD_TASK_PRIORITY, &s_sdcard_task);
 }
+
+#endif /* FEATURE_SD_CARD */

@@ -105,11 +105,32 @@ void log_raw(const char *str, uint16_t len)
     debug_transmit((uint8_t *)str, len);
 }
 
+/* 运行时日志级别（#LOG 命令用）：默认 DEBUG = 与改动前行为一致（全部输出）。
+ * 0=只错误(ERR) 1=事件(INFO，默认推荐，隐藏 DEBUG 高频帧) 2/3=调试(DEBUG) */
+static uint8_t s_run_level = LOG_LEVEL_DEBUG;
+
+void log_set_level(uint8_t level)
+{
+    if (level <= LOG_LEVEL_DEBUG)
+    {
+        s_run_level = level;
+    }
+}
+
+uint8_t log_get_level(void)
+{
+    return s_run_level;
+}
+
 void log_out(uint8_t level, const char *tag, const char *fmt, ...)
 {
     if ((fmt == NULL) || (level > LOG_LEVEL_DEBUG) || (level == LOG_LEVEL_NONE))
     {
         return;
+    }
+    if (level > s_run_level)
+    {
+        return; /* 运行时级别过滤（#LOG 设置；默认不过滤） */
     }
 
     char buf[LOG_FMT_BUF_SIZE];

@@ -70,6 +70,8 @@
 /* 栈上格式化一条日志并一次提交（自动补 CRLF；无共享缓冲竞争，多任务安全） */
 void log_out(uint8_t level, const char *tag, const char *fmt, ...);
 void log_raw(const char *str, uint16_t len);  /* 无时间戳无标签直发（CLI 提示符/回显用） */
+void log_set_level(uint8_t level);            /* 运行时日志级别（#LOG 命令）：0=ERR 1=INFO 2/3=DEBUG */
+uint8_t log_get_level(void);
 
 /* 非阻塞写发送缓冲（log_out 与 printf/fputc 的底层出口） */
 void debug_transmit(uint8_t *data, uint16_t len);

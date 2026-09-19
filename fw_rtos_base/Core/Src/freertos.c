@@ -22,6 +22,7 @@
 #include "task.h"
 #include "bsp_log.h"
 #include "main.h"
+#include "fault_log.h"  /* 崩溃黑匣子（RTC 备份寄存器） */
 #include "cmsis_os.h"
 
 /* Private includes ----------------------------------------------------------*/
@@ -156,6 +157,7 @@ void vApplicationStackOverflowHook(TaskHandle_t xTask, char *pcTaskName)
             s_overflow_task[i] = pcTaskName[i];
         }
     }
+    FaultLog_StoreStackOverflow(pcTaskName); /* ★ 黑匣子：复位后仍可读 */
     s_overflow_handle = (uint32_t)xTask;
     s_overflow_psp = (uint32_t)__get_PSP();
     s_overflow_cfsr = SCB->CFSR;

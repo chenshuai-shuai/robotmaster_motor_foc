@@ -18,24 +18,30 @@
 #include "task.h"
 #include "bsp_log.h"
 #include "main.h"
+#include "board_config.h" /* 板级引脚常量（K5：模块里不出现裸引脚值） */
 #include "sys_status.h"
+#include "feature_config.h"   /* M3：文件级隔离需要一个统一的开关 */
+
+
+#if FEATURE_LED_TASK
+/* M3 文件级隔离（docs/规范_功能宏与模块化.md R3）：未启用时本文件编译为空对象。
+ * 被谁调用必须由调用点用同一个宏保护（忘保护=链接失败，这是刻意设计的 fail-fast）。 */
 
 /* ---- 板载 LED：低电平点亮 ---- */
-#define LED_GREEN_PORT GPIOF
-#define LED_GREEN_PIN  GPIO_PIN_14
-#define LED_RED_PORT   GPIOE
-#define LED_RED_PIN    GPIO_PIN_11
+#define LED_GREEN_PORT BRD_LED_GRN_PORT
+#define LED_GREEN_PIN  BRD_LED_GRN_PIN
+#define LED_RED_PORT   BRD_LED_RED_PORT
+#define LED_RED_PIN    BRD_LED_RED_PIN
 
 #define LED_ON(pin)   HAL_GPIO_WritePin(pin##_PORT, pin##_PIN, GPIO_PIN_RESET)
 #define LED_OFF(pin)  HAL_GPIO_WritePin(pin##_PORT, pin##_PIN, GPIO_PIN_SET)
 
 /* ---- 外接 8×LED：PG1~PG8 ---- */
-#define LED_EXT_PORT      GPIOG
-#define LED_EXT_PIN_MASK  (GPIO_PIN_1|GPIO_PIN_2|GPIO_PIN_3|GPIO_PIN_4|\
-                           GPIO_PIN_5|GPIO_PIN_6|GPIO_PIN_7|GPIO_PIN_8)
-#define LED_EXT_ON_LEVEL  GPIO_PIN_RESET
-#define LED_EXT_ON(i)     HAL_GPIO_WritePin(LED_EXT_PORT, (GPIO_PIN_1 << (i)), LED_EXT_ON_LEVEL)
-#define LED_EXT_OFF(i)    HAL_GPIO_WritePin(LED_EXT_PORT, (GPIO_PIN_1 << (i)), \
+#define LED_EXT_PORT      BRD_LED_EXT_PORT
+#define LED_EXT_PIN_MASK  BRD_LED_EXT_MASK
+#define LED_EXT_ON_LEVEL  BRD_LED_ON_LEVEL
+#define LED_EXT_ON(i)     HAL_GPIO_WritePin(LED_EXT_PORT, (BRD_LED_EXT_FIRST_PIN << (i)), LED_EXT_ON_LEVEL)
+#define LED_EXT_OFF(i)    HAL_GPIO_WritePin(LED_EXT_PORT, (BRD_LED_EXT_FIRST_PIN << (i)), \
                                             (LED_EXT_ON_LEVEL == GPIO_PIN_SET) ? GPIO_PIN_RESET : GPIO_PIN_SET)
 
 #define LED_TICK_MS   50U   /* LED 任务刷新粒度 */
@@ -142,3 +148,26 @@ void Led_Task_Init(void)
     led_gpio_init();
     xTaskCreate(led_task, "LedTask", 512, NULL, 5, &s_led_task);
 }
+
+/* --------------------------- 模块自检（#ST led） --------------------------- */
+/* 非破坏性：只读回 GPIO 配置寄存器（MODER），确认 LED 引脚仍是"通用推挽输出"。
+ * 不去动灯、不闪灯 —— 心跳由 Led_Task 自己负责，自检只回答"引脚还归我们管吗"。 */
+static uint8_t pin_is_output(GPIO_TypeDef *port, uint16_t pin)
+{
+    uint32_t pos = 0u;
+    uint32_t p = (uint32_t)pin;
+
+    while ((p >>= 1) != 0u)
+        pos++;
+    return (uint8_t)(((port->MODER >> (2u * pos)) & 0x3u) == 0x1u);
+}
+
+uint8_t Led_SelfTest(void)
+{
+    if ((pin_is_output(LED_GREEN_PORT, LED_GREEN_PIN) == 0u) ||
+        (pin_is_output(LED_RED_PORT, LED_RED_PIN) == 0u))
+        return 3u; /* 引脚没配成输出：GPIO 初始化没跑，或被别人改了 */
+    return 1u;
+}
+
+#endif /* FEATURE_LED_TASK */

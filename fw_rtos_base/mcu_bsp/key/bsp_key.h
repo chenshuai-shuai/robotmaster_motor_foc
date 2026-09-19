@@ -11,13 +11,14 @@
 #define BSP_KEY_H
 
 #include "stdint.h"
+#include "board_config.h" /* 板级引脚常量（K5：模块里不出现裸引脚值） */
 #include "FreeRTOS.h"
 #include "event_groups.h"
 #include "key_core.h"
 
 /* ------------------------------ 硬件定义 ------------------------------ */
-#define KEY_GPIO_PORT (GPIOB)
-#define KEY_GPIO_PIN (GPIO_PIN_2)
+#define KEY_GPIO_PORT (BRD_KEY_PORT)
+#define KEY_GPIO_PIN (BRD_KEY_PIN)
 #define KEY_GPIO_PULL (GPIO_PULLUP) /* 内部上拉兜底（若板上已有外部上拉也无害） */
 #define KEY_ACTIVE_LEVEL (1u)       /* 有效电平：1=按下为高。**A 板实测 2026-09-15**：PB2 空闲为低、按下为高（高有效）；换板/改电路看开机日志 idle raw level 再定 */
 
@@ -27,10 +28,10 @@
 #define KEY_TASK_STACK_WORDS (256u)
 
 /* ------------------------------ 事件位 ------------------------------ */
-#define KEY_BIT_CLICK (1u << 0)        /* 单击（UI：光标下移） */
-#define KEY_BIT_DOUBLE (1u << 1)       /* 双击（UI：光标上移） */
-#define KEY_BIT_HOLD_RELEASE (1u << 2) /* 长按松手（动作层判阈值，如 2s） */
-#define KEY_BIT_STUCK (1u << 3)        /* 卡死检测（忽略该键 + 告警） */
+#define KEY_BIT_CLICK (1u << 0)        /* 单击（UI：下一页） */
+#define KEY_BIT_DOUBLE (1u << 1)       /* 双击（UI：上一页） */
+#define KEY_BIT_HOLD_RELEASE (1u << 2) /* 长按松手（UI：≥2s 回主页；动作层由 ui_action.h 判定） */
+#define KEY_BIT_STUCK (1u << 3)        /* 卡死检测（该次手势作废 + 告警） */
 
 #ifdef __cplusplus
 extern "C"
@@ -46,6 +47,9 @@ uint32_t Key_GetHoldMs(void);  /* 当前按住时长 ms（长按进度条用） 
 uint8_t Key_GetRawLevel(void); /* GPIO 原始电平（实测方向用） */
 void Key_GetCore(KeyCore_t *out);                  /* 统计数据拷贝（屏幕显示用） */
 void Key_GetLastMsg(KeyCore_Msg_t *out, uint32_t *ms); /* 最近一次事件快照（提示行用，不消费事件位） */
+
+/* 模块自检（非破坏性）：0=未编译 1=OK 2=WARN（按下不放疑似卡住/短路） 3=FAIL（驱动没初始化） */
+uint8_t Key_SelfTest(void);
 
 #ifdef __cplusplus
 }

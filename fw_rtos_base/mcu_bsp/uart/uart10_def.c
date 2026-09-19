@@ -10,6 +10,11 @@
 #include "bsp_usart.h"
 #include "usart.h"
 #include "main.h"
+#include "feature_config.h"
+
+#if FEATURE_SERIAL_CTRL
+#include "CmdRx_Task.h" /* 串口协议：收到一行命令 → CmdRx_RxIsr() 搬进环形缓冲 */
+#endif
 
 USARTInstance uart10;
 
@@ -17,7 +22,11 @@ void UART10_Init(void)
 {
     USART_Init_Config_s cfg = {0};
     cfg.usart_handle = &huart6;          /* 默认 USART6，可在 CubeMX 里配置引脚 */
-    cfg.recv_buff_size = 128;            /* CLI 命令行接收（行长 96） */
+    cfg.recv_buff_size = 128;            /* 命令行接收缓冲（协议行长 ≤128） */
+#if FEATURE_SERIAL_CTRL
+    cfg.module_callback = CmdRx_RxIsr;   /* DMA+IDLE 收包回调（中断上下文：只搬字节） */
+#else
     cfg.module_callback = NULL;
+#endif
     USARTRegister(&uart10, &cfg);
 }

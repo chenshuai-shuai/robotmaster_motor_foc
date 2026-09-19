@@ -85,6 +85,9 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
                 /* 【死锁修复 2026-08-21】此处不得放日志（中断上下文 snprintf/log_raw
                  * 触发任务级 xTaskNotifyGive 死锁）。接收诊断改用回调内的 g_sd_step
                  * 或任务上下文打印。 */
+                /* 【2026-09-17 新增】先把本次实际收到的长度交给实例，回调才能知道包边界
+                 * （回调本身无参数；buffer 的 memset 在回调之后才执行，所以回调内数据完整） */
+                usart_instance[i]->recv_len = Size;
                 usart_instance[i]->module_callback();
                 memset(usart_instance[i]->recv_buff, 0, Size); // 接收结束后清空buffer,对于变长数据是必要的
             }

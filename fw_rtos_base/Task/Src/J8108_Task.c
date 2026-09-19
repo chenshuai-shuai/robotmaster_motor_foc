@@ -1,116 +1,552 @@
 /*
- * J8108_Task.c - 8108 关节电机任务（A 板 CAN1，1Mbps）
+ * J8108_Task.c - 8108 控制任务（控制帧发生器 + 外环 + 保护）
  *
- * 目标：用 RoboMaster A 板控制 8108 关节电机（STACKFORCE 单编 24V）
- *   ① CAN 链路（收到 0x781 反馈帧） ② 使能（RGB 红→绿） ③ 控制+反馈闭环（能转、数字对）
+ * 职责（详见 J8108_Task.h 与 docs/协议_串口控制_v1.md）：
+ *   1. 200Hz 控制帧生成：Ctrl_Step() 算出 (p,v,Kp,Kd,t_ff) → J8108_SendMIT()
+ *   2. 使能/失能/零点握手：发帧 → 等 20ms → 查 ACK（本板 AutoRetransmission=ENABLE，
+ *      无人应答会无限重传 → 必须主动 HAL_CAN_AbortTxRequest 丢帧）
+ *   3. 心跳看门狗：200ms 无命令 → 退 DAMP（**不失能**：本电机无抱闸，失能会自由坠落）
+ *   4. 保护：跟随误差 / 堵转 / 过温 / 电机报错位 → @EVT + 退阻尼
+ *   5. 链路日志：只在**状态边沿**与**数据新鲜**时打印（绝不重播旧数据）
  *
- * 运行模式（宏切换，见 feature_config.h 与本文件 J8108_AUTO_DEMO）：
- *   - 默认 J8108_AUTO_DEMO=0 → **只监听，不发任何帧**（M1/M2 阶段，电机绝对安全）
- *   - =1 → 上电自动演示序列：使能 → 校验反馈 → 阻尼 → 慢转正/反 → 自动失能
- *
- * 日志约定：全部英文/ASCII（串口终端下中文会乱码）。
- * 开发期详日志（FEATURE_VERBOSE_LOG=1）：前 N 帧反馈打印**原始字节 + 解算值**（校验解析用），
- *   并打印链路 UP/DOWN 边沿；之后每 10s 一条摘要。
- *
- * 接线（通电前核对）：A 板 CAN1 口 CAN_H/CAN_L(/GND) ↔ 电机 XT30(2+2) 的 CAN 两针（H/L 勿反）；
- *   电机 24V 独立供电；电机端 120Ω 开关开（A 板自带 R80 120Ω）；电机默认 CANID=0x01；先单机挂总线。
+ * 线程：本任务 prio 5（最高）保时；屏刷/日志/遥测在 Monitor（prio 3）——绝不在控制路径上。
+ * 说明：**本文件是唯一往 CAN 发帧的地方**（单线程访问，杜绝跨任务竞争）。
  */
 #include "J8108_Task.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
+
 #include "bsp_log.h"
 #include "motor_8108.h"
-#include "j8108_action.h"
-#include "bsp_key.h"   /* 长按事件（Key_EventGroup / KEY_BIT_HOLD_RELEASE） */
-#include "Oled_Task.h" /* 读当前光标行（决定长按作用在哪一行） */
+#include "ctrl_core.h"
+#include "proto_tx.h"  /* @EVT 事件上报（M2：去掉 ui_action.h 反向依赖 —— 控制层不该依赖 UI 层） */
 #include "version.h"
 #include "main.h"
+#include "can.h"       /* hcan1：J8108_Task_Init 里必须做 CAN 注册 */
+#include "stack_probe.h" /* 栈余量自报 */
 #include "feature_config.h"
 
-/* ---- 测试参数（按需修改） ---- */
-#define J8108_STARTUP_DELAY_MS 3000u /* 上电静置 */
-#define J8108_CHECK_MS 1500u         /* 每次等反馈的窗口 */
-#define J8108_ENABLE_RETRY_MAX 3u    /* 使能尝试次数（含首次） */
-#define J8108_DAMP_MS 3000u          /* 阻尼保持时长 */
-#define J8108_SPIN_MS 3000u          /* 单向慢转时长 */
-#define J8108_DAMP2_MS 2000u
-#define J8108_SPIN_SPEED_RADS 0.6f /* 慢转速度（输出端 rad/s，约 5.7 RPM） */
-#define J8108_CTRL_PERIOD_MS 5u    /* MIT 帧周期（200Hz） */
-#define J8108_PRINT_PERIOD_MS 500u /* 反馈打印周期 */
-#define J8108_DAMP_KD 1.0f         /* 阻尼系数（首动作，防乱动） */
-#define J8108_HOLD_ON_ENABLE 1u    /* 1=使能确认后自动进入"阻尼保持"(HOLD)：周期发 MIT 帧。
-                                    *   **实测依据（2026-09-15）**：本电机反馈帧是"响应式心跳"——只发 0xFC 使能
-                                    *   后它绿灯亮但**不回传任何帧**；必须持续发 MIT 帧才有反馈（台架演示程序
-                                    *   正是 200Hz 发帧才收到反馈）。HOLD 即"读回参数"的通道，也是安全阻尼。
-                                    *   0=使能后完全不发帧（只用来验证"是否真的不发帧就没反馈"）*/
-#define J8108_HOLD_WD_MS 20u       /* HOLD 看门狗轮询周期 */
-#define J8108_HOLD_TX_STUCK_MS 100u /* **连续占用**超过此值才判"无 ACK"（实测踩坑：最初用"邮箱非全空"判 → 把正在发送的 130µs 误判成无 ACK，把 HOLD 反复掐断）*/
-#define J8108_HOLD_FB_LOST_MS 500u /* HOLD 模式下反馈超时 → 退出并尝试恢复 */
-#define J8108_HOLD_RETRY_MS 500u   /* 自动恢复重试间隔基数（第 n 次失败退避 n×基数）*/
-#define J8108_HOLD_RETRY_MAX 4u    /* 连续失败上限：超过则放弃并提示（防无限刷屏/重传；用户再按一次即可重来）*/
+#include <stdio.h>
+#include <string.h>
 
-/* ---- 运行模式 ---- */
-#define J8108_AUTO_DEMO 0u         /* 1=上电自动演示；0=只监听，不发任何帧 */
-#define J8108_LISTEN_LOG_MS 10000u /* 仅监听模式：状态摘要周期 */
-#define J8108_FB_LOG_MS 1000u      /* 反馈流日志周期（0=关闭）：接入电机后 1Hz 打一条解算值，
-                                    * 便于手拧输出轴时在终端盯数字（验证解析用；噪声仅 1 行/秒） */
-#define J8108_FB_TIMEOUT_MS 200u   /* 反馈超时 → 判链路断 */
-#define J8108_VERBOSE_FRAMES 10u   /* 详日志：前 N 帧逐帧打印（含原始字节） */
+#if FEATURE_J8108   /* M2：实现全文被宏包住（未编译时走文件末尾的"显式停用桩"） */
 
-#define J8108_TASK_PRIORITY 5u
-#define J8108_TASK_STACK_WORDS 640u
-
-typedef enum
-{
-    PH_IDLE = 0,
-    PH_ENABLE,
-    PH_CHECK,
-    PH_DAMP,
-    PH_SPIN_FWD,
-    PH_SPIN_REV,
-    PH_DAMP2,
-    PH_DONE
-} J8108_Phase_e;
+/* ------------------------------ 任务参数 ------------------------------ */
+#define J8108_TASK_PRIORITY (5U)
+#define J8108_TASK_STACK_WORDS (640U)
+#define J8108_CTRL_PERIOD_MS (5U)    /* 控制帧周期 200Hz */
+#define J8108_EN_ACK_MS (20U)        /* 使能帧后等 ACK 的时长（1Mbps 单帧 ~130µs，20ms 极宽裕） */
+#define J8108_WD_POLL_MS (20U)       /* 帧/链路看门狗轮询周期 */
+#define J8108_TX_STUCK_MS (100U)     /* TX 邮箱"连续占用"超此值 = 无人 ACK */
+#define J8108_FB_LOST_MS (500U)      /* 反馈超时 = 链路丢 */
+#define J8108_FB_FRESH_MS (200U)     /* 数据新鲜门槛（屏/日志/遥测统一） */
+#define J8108_RETRY_MS (500U)        /* 自动恢复退避基数（n×基数） */
+#define J8108_RETRY_MAX (4U)         /* 连续失败上限：超过则放弃并提示（用户 `#EN` 重来） */
 
 static TaskHandle_t s_task_handle;
 static J8108_t *s_dev;
-static J8108_Phase_e s_phase = PH_IDLE;
-static uint32_t s_phase_start_ms = 0;
-static uint32_t s_try_cnt = 0;
-static uint32_t s_mark_count = 0; /* 发使能时的反馈计数基线 */
-static uint8_t s_link_ok = 0;     /* 链路状态（边沿日志用） */
-static uint8_t s_status_dbg = 0xFFu; /* 状态边沿日志用（0xFF=未初始化） */
-static uint32_t s_last_rx_dbg = 0;
+static Ctrl_State_t s_ctrl;
+static Ctrl_Params_t s_params;
+
+static uint8_t s_link_ok = 0u;
+static uint8_t s_status_dbg = 0xFFu;
+static uint32_t s_last_rx_dbg = 0u;
+static uint32_t s_ev_latch = 0u;
+
+/* 使能类请求握手 */
+static volatile uint8_t s_req = (uint8_t)J8108_REQ_NONE;
+static volatile uint8_t s_res = (uint8_t)J8108_RES_NONE;
+static volatile uint8_t s_req_fresh = 0u; /* 1=请求刚发起，需要执行发送阶段 */
+static uint32_t s_req_sent_ms = 0u;
+
+/* 自动恢复（掉线后重试使能握手） */
+static uint8_t s_fail = 0u;
+static uint8_t s_want_recover = 0u;
+static uint32_t s_retry_ms = 0u;
+static uint32_t s_hold_rx_seen = 0u;
+
+/* 发送节拍 */
+static uint32_t s_tx_ms = 0u;
+/* 控制循环"最大间隔"（抖动/饿死证据）：10s 窗口内的最大 dt，由 Monitor 取走打印 */
+static volatile uint32_t s_dt_max_ms = 0u;
+static uint32_t s_wd_ms = 0u;
+static float s_kp_dbg = 0.0f;
+static float s_kd_dbg = 0.0f;
 
 static uint32_t now_ms(void)
 {
     return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
 }
 
-static void phase_enter(J8108_Phase_e ph)
+static CAN_HandleTypeDef *j8108_can(void)
 {
-    s_phase = ph;
-    s_phase_start_ms = now_ms();
+    return (s_dev->can_instance != NULL) ? s_dev->can_instance->can_handle : NULL;
 }
 
-static void print_feedback(void)
+/* --------------------------- 请求握手 API（CmdRx 调用） --------------------------- */
+void J8108_ReqStart(J8108_Req_e r, const char *why)
 {
-    LOG_I("J8108", "fb pos=%.3frad(motor)/%.1fdeg(out) vel=%.2frad/s T=%.3fNm Tm=%.1fC Tr=%.1fC rx=%lu",
-          (double)s_dev->fb.pos, (double)(s_dev->fb.pos / 8.0f * 57.2958f),
-          (double)s_dev->fb.vel, (double)s_dev->fb.torque,
-          (double)s_dev->fb.t_mos, (double)s_dev->fb.t_rotor,
-          (unsigned long)s_dev->fb.rx_count);
+    s_req = (uint8_t)r;
+    s_res = (uint8_t)J8108_RES_NONE;
+    s_req_fresh = 1u;
+    s_req_sent_ms = 0u;
+    LOG_I("J8108", "request queued: %s (%s)",
+          (r == J8108_REQ_EN) ? "ENABLE" : ((r == J8108_REQ_DIS) ? "DISABLE" : "ZERO"),
+          (why != NULL) ? why : "-");
 }
 
-/* 链路 UP/DOWN 边沿 + （详日志）前 N 帧原始字节 */
+J8108_Res_e J8108_ReqResult(void)
+{
+    return (J8108_Res_e)s_res;
+}
+
+void J8108_ReqClear(void)
+{
+    s_res = (uint8_t)J8108_RES_NONE;
+    s_req = (uint8_t)J8108_REQ_NONE;
+}
+
+/* ------------------------------ 控制命令 API ------------------------------ */
+/* #SETP 原始直通：#SET SETP 1 解锁后生效；任何常规运动命令都会自动退出直通（防"忘了还开着"）*/
+static uint8_t s_raw_on = 0u;
+static float s_raw[5];
+
+void J8108_SetRawMIT(float p_rad, float v_rps, float kp, float kd, float t_nm)
+{
+    s_raw[0] = p_rad;
+    s_raw[1] = v_rps;
+    s_raw[2] = kp;
+    s_raw[3] = kd;
+    s_raw[4] = t_nm;
+    s_raw_on = 1u;
+    LOG_W("J8108", "SETP raw passthrough ON: p=%.4f v=%.3f kp=%.1f kd=%.2f t=%.3f (motor units, NO clamping)",
+          (double)p_rad, (double)v_rps, (double)kp, (double)kd, (double)t_nm);
+}
+
+static void raw_off(void)
+{
+    if (s_raw_on != 0u)
+    {
+        s_raw_on = 0u;
+        LOG_I("J8108", "SETP raw passthrough OFF (back to outer-loop control)");
+    }
+}
+
+void J8108_KeepAlive(void)
+{
+    Ctrl_Ping(&s_ctrl, now_ms());
+}
+
+uint8_t J8108_IsEnabled(void)
+{
+    return s_ctrl.enabled;
+}
+
+uint8_t J8108_IsSending(void)
+{
+    return (uint8_t)((s_ctrl.enabled != 0u) && (s_ctrl.mode != CTRL_MODE_IDLE));
+}
+
+uint8_t J8108_SetMode(Ctrl_Mode_e m)
+{
+    if ((m != CTRL_MODE_IDLE) && (m != CTRL_MODE_DAMP) && (s_ctrl.enabled == 0u))
+    {
+        return 0u; /* 运动模式必须先使能 */
+    }
+    raw_off(); /* 切模式即退出 #SETP 直通 */
+    if (m == CTRL_MODE_IDLE)
+    {
+        s_ctrl.mode = CTRL_MODE_IDLE; /* 停发帧（保持使能状态，靠 #EN/#DIS 改） */
+        return 1u;
+    }
+    Ctrl_SetMode(&s_ctrl, m, s_dev->fb.pos * J8108_RAD2DEG, s_dev->fb.vel * J8108_RAD2DEG);
+    return 1u;
+}
+
+void J8108_SetPosDeg(float deg)
+{
+    raw_off();
+    /* ★ 关键：先经 Ctrl_SetMode 把 set_applied 预置为**当前实际角**。
+     * 否则 set_applied 会保留上一个模式的值（如 DAMP 的 0），slew 从 0 开始 →
+     * 与真实位置的巨大 PD 误差 → 猛冲（审查抓到的安全问题）。 */
+    Ctrl_SetMode(&s_ctrl, CTRL_MODE_POS, s_dev->fb.pos * J8108_RAD2DEG, s_dev->fb.vel * J8108_RAD2DEG);
+    Ctrl_SetPos(&s_ctrl, deg);
+}
+
+void J8108_SetVelDps(float dps)
+{
+    raw_off();
+    Ctrl_SetMode(&s_ctrl, CTRL_MODE_SPEED, s_dev->fb.pos * J8108_RAD2DEG, s_dev->fb.vel * J8108_RAD2DEG);
+    Ctrl_SetVel(&s_ctrl, dps); /* 速度设定点从 0 起、按 #RATE 斜坡 */
+}
+
+void J8108_SetVelTff(float tff)
+{
+    Ctrl_SetTff(&s_ctrl, tff); /* 前馈不切模式（#V 第 3 参） */
+}
+
+void J8108_SetTorqueNm(float nm)
+{
+    raw_off();
+    Ctrl_SetMode(&s_ctrl, CTRL_MODE_TORQUE, s_dev->fb.pos * J8108_RAD2DEG, s_dev->fb.vel * J8108_RAD2DEG);
+    Ctrl_SetTorque(&s_ctrl, nm);
+}
+
+void J8108_SetImp(float kp, float kd, float tff)
+{
+    raw_off();
+    /* 阻抗参考角 = 进入时**实际角**（先 Ctrl_SetMode 再 SetImp） */
+    Ctrl_SetMode(&s_ctrl, CTRL_MODE_IMP, s_dev->fb.pos * J8108_RAD2DEG, s_dev->fb.vel * J8108_RAD2DEG);
+    Ctrl_SetImp(&s_ctrl, &s_params, kp, kd, tff);
+}
+
+void J8108_SetDampKd(float kd)
+{
+    raw_off();
+    Ctrl_SetDamp(&s_ctrl, &s_params, kd);
+}
+
+void J8108_StopSoft(void)
+{
+    Ctrl_Release(&s_ctrl);
+}
+
+void J8108_StopHard(void)
+{
+    raw_off();
+    Ctrl_Estop(&s_ctrl);                              /* enabled=0 → 立即停发控制帧 */
+    J8108_ReqStart(J8108_REQ_DIS, "estop");           /* 失能帧由控制任务在本任务上下文发出 */
+    s_ev_latch |= CTRL_EV_ESTOP;
+    LOG_W("J8108", "HARD ESTOP: frames off + DISABLE queued (output shaft will be FREE - no brake!)");
+}
+
+const Ctrl_State_t *J8108_State(void)
+{
+    return &s_ctrl;
+}
+
+Ctrl_Params_t *J8108_Params(void)
+{
+    return &s_params;
+}
+
+uint32_t J8108_LoopJitterTake(void)
+{
+    uint32_t v = s_dt_max_ms;
+
+    s_dt_max_ms = 0u; /* 读后清零：每个窗口独立统计 */
+    return v;
+}
+
+uint32_t J8108_EventLatch(void)
+{
+    return s_ev_latch;
+}
+
+void J8108_DbgFrames(float *kp, float *kd)
+{
+    if (kp != NULL)
+        *kp = s_kp_dbg;
+    if (kd != NULL)
+        *kd = s_kd_dbg;
+}
+
+/* ------------------------------ 事件上报 ------------------------------ */
+static void ev_report(uint16_t ev)
+{
+    char b[96];
+
+    if (ev == 0u)
+        return;
+    if ((ev & CTRL_EV_TIMEOUT) != 0u)
+    {
+        LOG_W("J8108", "EVT TIMEOUT: no command for %ums -> back to DAMP (motor stays ENABLED)", (unsigned)s_params.wd_ms);
+        Proto_Send("@EVT TIMEOUT mode=DAMP");
+    }
+    if ((ev & CTRL_EV_LIMIT) != 0u)
+    {
+        (void)snprintf(b, sizeof(b), "@EVT LIMIT what=%s", Ctrl_LimitWhat(&s_ctrl));
+        Proto_Send(b);
+    }
+    if ((ev & CTRL_EV_FOLLOW) != 0u)
+    {
+        LOG_W("J8108", "EVT FOLLOW: position error too large -> DAMP");
+        Proto_Send("@EVT FOLLOW mode=DAMP");
+    }
+    if ((ev & CTRL_EV_STALL) != 0u)
+    {
+        LOG_W("J8108", "EVT STALL: high torque + low speed -> DAMP");
+        Proto_Send("@EVT STALL mode=DAMP");
+    }
+    if ((ev & CTRL_EV_TEMP) != 0u)
+    {
+        (void)snprintf(b, sizeof(b), "@EVT TEMP Tm=%.1f Tr=%.1f warn=%.0f stop=%.0f",
+                       (double)s_dev->fb.t_mos, (double)s_dev->fb.t_rotor,
+                       (double)s_params.temp_warn_c, (double)s_params.temp_stop_c);
+        LOG_W("J8108", "EVT TEMP: Tm=%.1f Tr=%.1f (warn %.0f / stop %.0f)",
+              (double)s_dev->fb.t_mos, (double)s_dev->fb.t_rotor, (double)s_params.temp_warn_c, (double)s_params.temp_stop_c);
+        Proto_Send(b);
+    }
+    if ((ev & CTRL_EV_MOTERR) != 0u)
+    {
+        LOG_E("J8108", "EVT MOTOR ERR: byte0=0x%02X (%s)", s_dev->fb.err, J8108_ErrStr(s_dev->fb.err));
+        (void)snprintf(b, sizeof(b), "@EVT ERR=0x%02X what=%s", s_dev->fb.err, J8108_ErrStr(s_dev->fb.err));
+        Proto_Send(b);
+    }
+    if ((ev & CTRL_EV_ESTOP) != 0u)
+    {
+        Proto_Send("@EVT ESTOP mode=DISABLED");
+    }
+}
+
+/* --------------------------- 使能/失能/零点 握手 --------------------------- */
+static void j8108_req_poll(uint32_t t)
+{
+    CAN_HandleTypeDef *h = j8108_can();
+    char b[96];
+
+    /* 自动恢复：掉线后按退避重试"使能握手" */
+    if ((s_want_recover != 0u) && (s_ctrl.enabled == 0u) &&
+        ((int32_t)(t - s_retry_ms) >= 0) && (s_req == (uint8_t)J8108_REQ_NONE))
+    {
+        J8108_ReqStart(J8108_REQ_EN, "auto-resume");
+    }
+
+    if (s_req == (uint8_t)J8108_REQ_NONE)
+    {
+        return;
+    }
+
+    /* CAN 未就绪：直接失败（不重试，用户要求） */
+    if ((s_dev->init_ok == 0u) || (s_dev->status == (uint8_t)J8108_ST_BUS_ERR))
+    {
+        s_res = (uint8_t)J8108_RES_BUSY;
+        s_req_fresh = 0u;
+        LOG_E("J8108", "request rejected: CAN not ready (status=%s)", J8108_StatusStr(s_dev->status));
+        return;
+    }
+    if (h == NULL)
+    {
+        s_res = (uint8_t)J8108_RES_BUSY;
+        s_req_fresh = 0u;
+        return;
+    }
+
+    /* 阶段 1：发送 */
+    if (s_req_fresh != 0u)
+    {
+        s_req_fresh = 0u;
+        if (s_req == (uint8_t)J8108_REQ_EN)
+        {
+            LOG_I("J8108", "-> ENABLE frame (0x%03X id, data ...FC) | wait %ums for ACK", J8108_CMD_ID, (unsigned)J8108_EN_ACK_MS);
+            J8108_SendCmd(J8108_CMD_ENABLE);
+        }
+        else if (s_req == (uint8_t)J8108_REQ_DIS)
+        {
+            s_ctrl.enabled = 0u; /* 立即停发控制帧，腾空邮箱给失能帧 */
+            s_ctrl.mode = CTRL_MODE_IDLE;
+            LOG_I("J8108", "-> DISABLE frame (data ...FD) | wait %ums for ACK", (unsigned)J8108_EN_ACK_MS);
+            J8108_SendCmd(J8108_CMD_DISABLE);
+        }
+        else if (s_req == (uint8_t)J8108_REQ_ZERO)
+        {
+            LOG_I("J8108", "-> ZERO frame (data ...FE, power-off persistent) | wait %ums for ACK", (unsigned)J8108_EN_ACK_MS);
+            J8108_SendCmd(J8108_CMD_ZERO);
+        }
+        else
+        {
+            LOG_I("J8108", "-> CLEAR-ERR frame (data ...FA) | wait %ums for ACK", (unsigned)J8108_EN_ACK_MS);
+            J8108_SendCmd(J8108_CMD_CLEAR_ERR);
+        }
+        s_req_sent_ms = t;
+        return;
+    }
+
+    /* 阶段 2：等 ACK 结果 */
+    if ((uint32_t)(t - s_req_sent_ms) < (uint32_t)J8108_EN_ACK_MS)
+    {
+        return;
+    }
+    if (J8108_TxStuck(t, J8108_EN_ACK_MS) != 0u)
+    {
+        (void)HAL_CAN_AbortTxRequest(h, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
+        s_res = (uint8_t)J8108_RES_NOACK;
+        LOG_W("J8108", "no ACK in %ums -> TX aborted. check 24V / CAN_H-L / 120R / CANID=0x%02X", (unsigned)J8108_EN_ACK_MS, J8108_CAN_ID);
+        return;
+    }
+
+    s_res = (uint8_t)J8108_RES_OK;
+    if (s_req == (uint8_t)J8108_REQ_EN)
+    {
+        s_ctrl.enabled = 1u;
+        s_ctrl.estop = 0u;
+        s_fail = 0u;
+        s_want_recover = 0u;
+        Ctrl_SetMode(&s_ctrl, CTRL_MODE_DAMP, s_dev->fb.pos * J8108_RAD2DEG, s_dev->fb.vel * J8108_RAD2DEG);
+        Ctrl_Ping(&s_ctrl, t);
+        s_tx_ms = 0u; /* 下一轮立即发第一帧 */
+        LOG_I("J8108", "ENABLE ok -> mode=DAMP, control frames ON (200Hz) -> feedback should stream now");
+        Proto_Send("@EVT ENABLED mode=DAMP");
+    }
+    else if (s_req == (uint8_t)J8108_REQ_DIS)
+    {
+        s_want_recover = 0u;
+        LOG_I("J8108", "DISABLE ok -> frames off, motor de-energized (shaft FREE)");
+        Proto_Send("@EVT DISABLED");
+    }
+    else if (s_req == (uint8_t)J8108_REQ_ZERO)
+    {
+        LOG_I("J8108", "ZERO ok -> current position stored as zero (persistent)");
+        Proto_Send("@EVT ZERO");
+    }
+    else
+    {
+        LOG_I("J8108", "CLEAR-ERR ok -> motor error bits cleared (byte0=0x%02X now)", s_dev->fb.err);
+        (void)snprintf(b, sizeof(b), "@EVT CLRERR err=0x%02X", s_dev->fb.err);
+        Proto_Send(b);
+    }
+}
+
+/* --------------------------- 心跳 + 保护 --------------------------- */
+static void j8108_mode_poll(uint32_t t, uint32_t dt)
+{
+    uint16_t ev;
+
+    /* 心跳看门狗（仅使能时才有意义） */
+    if (s_ctrl.enabled != 0u)
+    {
+        if (Ctrl_Heartbeat(&s_ctrl, &s_params, t) != 0u)
+        {
+            raw_off(); /* 心跳超时退阻尼，同时退出 #SETP 直通 */
+        }
+    }
+
+    /* 保护检查：跟随误差 / 堵转 / 过温 / 电机报错位（**单一入口**，用最新反馈值） */
+    ev = Ctrl_Protect(&s_ctrl, &s_params,
+                      s_dev->fb.pos * J8108_RAD2DEG,
+                      s_dev->fb.vel * J8108_RAD2DEG,
+                      s_dev->fb.torque,
+                      s_dev->fb.t_mos, s_dev->fb.t_rotor,
+                      s_dev->fb.err, dt);
+    ev = (uint16_t)(ev | Ctrl_TakeEvents(&s_ctrl));
+    if (ev != 0u)
+    {
+        s_ev_latch |= (uint32_t)ev;
+        ev_report(ev);
+    }
+}
+
+/* --------------------------- 控制帧生成 --------------------------- */
+static void j8108_frame_poll(uint32_t t, uint32_t dt)
+{
+    CAN_HandleTypeDef *h = j8108_can();
+    Ctrl_Frame_t fr;
+    uint32_t rx = s_dev->fb.rx_count;
+
+    /* ---- 1. 帧看门狗：任何时刻都查（即使已停发 → 抓"急停帧/失能帧"卡死） ---- */
+    if (h != NULL)
+    {
+        if ((int32_t)(t - s_wd_ms) >= 0)
+        {
+            s_wd_ms = t + J8108_WD_POLL_MS;
+
+            if (J8108_TxStuck(t, J8108_TX_STUCK_MS) != 0u)
+            {
+                (void)HAL_CAN_AbortTxRequest(h, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
+                LOG_W("J8108", "TX not ACKed (mailbox stuck %ums) -> aborted; check 24V/CAN_H-L/120R/CANID",
+                      (unsigned)J8108_TX_STUCK_MS);
+                if (s_ctrl.enabled != 0u)
+                {
+                    s_ctrl.enabled = 0u;
+                    s_ctrl.mode = CTRL_MODE_IDLE;
+                    s_fail++;
+                    s_retry_ms = t + (uint32_t)J8108_RETRY_MS * (uint32_t)s_fail;
+                    if (s_fail >= J8108_RETRY_MAX)
+                    {
+                        s_want_recover = 0u;
+                        LOG_E("J8108", "no ACK %u times -> give up retrying; send #EN to try again", (unsigned)J8108_RETRY_MAX);
+                        Proto_Send("@EVT LINKLOST what=noack");
+                    }
+                    else
+                    {
+                        s_want_recover = 1u;
+                        LOG_W("J8108", "link lost (no ACK) -> will retry ENABLE in %ums (%u/%u)",
+                              (unsigned)(J8108_RETRY_MS * s_fail), (unsigned)s_fail, (unsigned)J8108_RETRY_MAX);
+                        Proto_Send("@EVT LINKLOST what=noack");
+                    }
+                }
+            }
+            else if ((s_ctrl.enabled != 0u) && (rx > 0u) && ((uint32_t)(t - s_dev->fb.last_rx_ms) > J8108_FB_LOST_MS))
+            {
+                s_ctrl.enabled = 0u;
+                s_ctrl.mode = CTRL_MODE_IDLE;
+                s_fail++;
+                s_retry_ms = t + (uint32_t)J8108_RETRY_MS * (uint32_t)s_fail;
+                if (s_fail >= J8108_RETRY_MAX)
+                {
+                    s_want_recover = 0u;
+                    LOG_E("J8108", "no feedback %u times -> stopped; check motor power/state; send #EN to retry", (unsigned)J8108_RETRY_MAX);
+                }
+                else
+                {
+                    s_want_recover = 1u;
+                    LOG_W("J8108", "no feedback for %ums -> retry ENABLE in %ums (%u/%u)",
+                          (unsigned)J8108_FB_LOST_MS, (unsigned)(J8108_RETRY_MS * s_fail), (unsigned)s_fail, (unsigned)J8108_RETRY_MAX);
+                }
+                Proto_Send("@EVT LINKLOST what=nofb");
+            }
+            else if (rx != s_hold_rx_seen)
+            {
+                s_hold_rx_seen = rx;
+                if (s_fail != 0u)
+                {
+                    LOG_I("J8108", "link healthy again (rx=%lu) -> failure counter reset", (unsigned long)rx);
+                    s_fail = 0u;
+                }
+            }
+        }
+    }
+
+    /* ---- 2. 生成帧参数（#SETP 直通优先；否则走外环） ---- */
+    if ((s_raw_on != 0u) && (s_ctrl.enabled == 0u))
+    {
+        raw_off(); /* 停帧状态下自动退出直通 */
+    }
+    if (s_raw_on != 0u)
+    {
+        fr.p_rad = s_raw[0];
+        fr.v_rps = s_raw[1];
+        fr.kp = s_raw[2];
+        fr.kd = s_raw[3];
+        fr.t_nm = s_raw[4];
+        fr.send = 1u;
+    }
+    else
+    {
+        Ctrl_Step(&s_ctrl, &s_params,
+                  s_dev->fb.pos * J8108_RAD2DEG, s_dev->fb.vel * J8108_RAD2DEG, dt, &fr);
+    }
+    s_kp_dbg = fr.kp;
+    s_kd_dbg = fr.kd;
+
+    /* ---- 3. 发送（200Hz；邮箱无空位就先不发，交看门狗处理） ---- */
+    if ((fr.send != 0u) && (h != NULL) && ((uint32_t)(t - s_tx_ms) >= (uint32_t)J8108_CTRL_PERIOD_MS) &&
+        (HAL_CAN_GetTxMailboxesFreeLevel(h) > 0u))
+    {
+        s_tx_ms = t;
+        J8108_SendMIT(fr.p_rad, fr.v_rps, fr.kp, fr.kd, fr.t_nm);
+    }
+}
+
+/* --------------------------- 链路日志（边沿 + 新鲜数据） --------------------------- */
 static void j8108_link_debug(uint32_t t)
 {
     uint8_t now_ok = 0u;
 
     if (s_dev->fb.rx_count > 0u)
     {
-        now_ok = ((t - s_dev->fb.last_rx_ms) < J8108_FB_TIMEOUT_MS) ? 1u : 0u;
+        now_ok = ((uint32_t)(t - s_dev->fb.last_rx_ms) < (uint32_t)J8108_FB_FRESH_MS) ? 1u : 0u;
     }
 
     if (now_ok != s_link_ok)
@@ -118,8 +554,7 @@ static void j8108_link_debug(uint32_t t)
         s_link_ok = now_ok;
         if (now_ok != 0u)
         {
-            LOG_I("J8108", "CAN feedback link UP (rx=%lu) -> motor is powered AND enabled",
-                  (unsigned long)s_dev->fb.rx_count);
+            LOG_I("J8108", "CAN feedback link UP (rx=%lu) -> motor powered AND enabled", (unsigned long)s_dev->fb.rx_count);
         }
         else
         {
@@ -128,7 +563,6 @@ static void j8108_link_debug(uint32_t t)
         }
     }
 
-    /* 状态变化才打日志（屏上四态同步）：INIT FAIL / INIT OK(WAITING) / READY / BUS ERR */
     if (s_dev->status != s_status_dbg)
     {
         s_status_dbg = s_dev->status;
@@ -138,10 +572,10 @@ static void j8108_link_debug(uint32_t t)
             LOG_E("J8108", "CAN status -> INIT FAIL (no retry by design): check CAN peripheral / device table");
             break;
         case J8108_ST_INIT_OK:
-            LOG_I("J8108", "CAN status -> INIT OK / WAITING for node (controller started, no frame on bus yet)");
+            LOG_I("J8108", "CAN status -> INIT OK / WAITING for node");
             break;
         case J8108_ST_READY:
-            LOG_I("J8108", "CAN status -> READY (feedback frames arriving): channel established, safe to send frames");
+            LOG_I("J8108", "CAN status -> READY (feedback arriving, channel established)");
             break;
         case J8108_ST_BUS_ERR:
             LOG_W("J8108", "CAN status -> BUS ERR (HAL err=0x%04lX): check ACK/wiring/120R", (unsigned long)s_dev->bus_err);
@@ -152,531 +586,72 @@ static void j8108_link_debug(uint32_t t)
     }
 
 #if FEATURE_VERBOSE_LOG
-    if ((s_dev->fb.rx_count != s_last_rx_dbg) && (s_dev->fb.rx_count <= J8108_VERBOSE_FRAMES))
+    if ((s_dev->fb.rx_count != s_last_rx_dbg) && (s_dev->fb.rx_count <= 10u))
     {
         const uint8_t *d = s_dev->fb.raw;
+
         s_last_rx_dbg = s_dev->fb.rx_count;
-        LOG_D("J8108", "fb#%lu raw %02X %02X %02X %02X %02X %02X %02X %02X | pos=%.3f vel=%.2f T=%.3f Tm=%.1f Tr=%.1f",
+        LOG_D("J8108", "fb#%lu raw %02X %02X %02X %02X %02X %02X %02X %02X | pos=%.2fdeg vel=%.1fdps T=%.3fNm Tm=%.1f Tr=%.1f err=0x%02X",
               (unsigned long)s_dev->fb.rx_count, d[0], d[1], d[2], d[3], d[4], d[5], d[6], d[7],
-              (double)s_dev->fb.pos, (double)s_dev->fb.vel, (double)s_dev->fb.torque,
-              (double)s_dev->fb.t_mos, (double)s_dev->fb.t_rotor);
+              (double)(s_dev->fb.pos * J8108_RAD2DEG), (double)(s_dev->fb.vel * J8108_RAD2DEG),
+              (double)s_dev->fb.torque, (double)s_dev->fb.t_mos, (double)s_dev->fb.t_rotor, s_dev->fb.err);
     }
 #endif
 }
 
-/* ========================= M3：单键动作层（L2 冷却 / L3.5 ACK / L4 反馈确认） ========================= */
-static uint32_t s_last_action_ms = 0u;                 /* L2 冷却基准 */
-static uint32_t s_act_result_ms = 0u;                  /* 结果时间戳（UI 判"最近 2.5s 内"） */
-static J8108_ActionResult_e s_act_result = ACTR_NONE;  /* 最近动作结果（屏上显示） */
-static J8108_Action_t s_pending = ACT_DO_NOTHING;      /* 已发帧、待确认的动作 */
-static uint32_t s_mark_rx = 0u;                        /* 发帧时的反馈计数基线 */
-static uint32_t s_ack_dl_ms = 0u;                      /* L3.5 截止时刻（0=已检查完） */
-static uint32_t s_confirm_dl_ms = 0u;                  /* L4 截止时刻 */
-/* 前置声明：下面 HOLD 段要用 M3 段里定义的两个静态辅助函数（定义在其后） */
-static CAN_HandleTypeDef *j8108_can(void);
-static void act_result_set(J8108_ActionResult_e r, uint32_t t);
-
-static uint8_t s_hold = 0u;                            /* HOLD（阻尼保持）模式开关 */
-static uint32_t s_hold_tx_ms = 0u;                     /* 上次发 MIT 帧时刻 */
-static uint32_t s_hold_wd_ms = 0u;                     /* 看门狗下次检查时刻 */
-static uint8_t s_hold_want = 0u;                       /* 用户意图：保持控制流（使能成功=1；失能/放弃=0）*/
-static uint32_t s_hold_retry_ms = 0u;                  /* 下次自动恢复时刻 */
-static uint8_t s_hold_fail = 0u;                       /* 连续失败计数（有进展即清零）*/
-static uint32_t s_hold_rx_seen = 0u;                   /* 上次看到的反馈计数 */
-static uint8_t s_ack_checked = 0u;                     /* L3.5 单次检查标志（防每轮重复进入 HOLD）*/
-static uint8_t s_tx_busy = 0u;                         /* TX 邮箱连续占用计时 */
-static uint32_t s_tx_busy_ms = 0u;
-
-/* TX 邮箱是否"**连续**占用"超过 limit_ms —— 只有持续占用才算无人 ACK；
- * 瞬时占用（该帧正在发送，~130µs@1Mbps）必须放过，否则会把正常运行判成故障。 */
-static uint8_t j8108_tx_stuck(uint32_t t, uint32_t limit_ms)
-{
-    CAN_HandleTypeDef *h = j8108_can();
-
-    if (h == NULL)
-    {
-        return 0u;
-    }
-    if (HAL_CAN_GetTxMailboxesFreeLevel(h) < 3u)
-    {
-        if (s_tx_busy == 0u)
-        {
-            s_tx_busy = 1u;
-            s_tx_busy_ms = t;
-        }
-        return ((t - s_tx_busy_ms) >= limit_ms) ? 1u : 0u;
-    }
-    s_tx_busy = 0u;
-    return 0u;
-}
-
-static void hold_enter(uint32_t t, const char *why)
-{
-    if (s_hold != 0u)
-    {
-        return;
-    }
-    s_hold = 1u;
-    s_hold_tx_ms = 0u; /* 下一轮立即发第一帧 */
-    s_hold_wd_ms = t + J8108_HOLD_WD_MS;
-    LOG_I("J8108", "HOLD mode ON (%s): sending MIT damping frames v=0 Kp=0 Kd=%.1f every %ums"
-                   " -> feedback (heartbeat) should now stream at the same rate",
-          why, (double)J8108_DAMP_KD, J8108_CTRL_PERIOD_MS);
-}
-
-static void hold_exit(uint32_t t, const char *why)
-{
-    if (s_hold == 0u)
-    {
-        return;
-    }
-    s_hold = 0u;
-    (void)t;
-    LOG_W("J8108", "HOLD mode OFF (%s): MIT frames stopped", why);
-}
-
-uint8_t J8108_IsHoldMode(void)
-{
-    return s_hold;
-}
-
-/* HOLD 模式：周期发 MIT 阻尼帧 + 看门狗（连续无 ACK / 反馈丢失 → 停发 + 退避自动恢复） */
-static void j8108_hold_poll(uint32_t t)
-{
-    CAN_HandleTypeDef *h;
-
-    if (s_hold == 0u)
-    {
-        /* 有保持意图但当前没在发（被误判掐断 / 反馈中断 / 电机刚回来）→ 退避自动恢复 */
-        if ((s_hold_want != 0u) && (s_hold_fail < J8108_HOLD_RETRY_MAX) &&
-            ((int32_t)(t - s_hold_retry_ms) >= 0))
-        {
-            hold_enter(t, "auto-resume");
-        }
-        return;
-    }
-
-    h = j8108_can();
-    if (h == NULL)
-    {
-        hold_exit(t, "no CAN handle");
-        return;
-    }
-
-    /* 周期发纯阻尼帧：邮箱没有空位就先不发（避免 SendMIT 内部自旋），交看门狗判死 */
-    if (((t - s_hold_tx_ms) >= J8108_CTRL_PERIOD_MS) && (HAL_CAN_GetTxMailboxesFreeLevel(h) > 0u))
-    {
-        s_hold_tx_ms = t;
-        J8108_SendMIT(0.0f, 0.0f, 0.0f, J8108_DAMP_KD, 0.0f); /* 纯阻尼：torque = -Kd·v */
-    }
-
-    /* 看门狗 */
-    if ((int32_t)(t - s_hold_wd_ms) >= 0)
-    {
-        s_hold_wd_ms = t + J8108_HOLD_WD_MS;
-
-        if (j8108_tx_stuck(t, J8108_HOLD_TX_STUCK_MS) != 0u)
-        {
-            (void)HAL_CAN_AbortTxRequest(h, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
-            s_hold_fail++;
-            s_hold_retry_ms = t + (uint32_t)J8108_HOLD_RETRY_MS * (uint32_t)s_hold_fail;
-            act_result_set(ACTR_EN_NO_ACK, t);
-            hold_exit(t, "no ACK");
-            if (s_hold_fail >= J8108_HOLD_RETRY_MAX)
-            {
-                s_hold_want = 0u;
-                LOG_E("J8108", "HOLD watchdog: no ACK %u times -> give up pinging (motor gone? check 24V/CAN_H-L/120R/CANID); press row0 to enable again",
-                      (unsigned)J8108_HOLD_RETRY_MAX);
-            }
-            else
-            {
-                LOG_W("J8108", "HOLD watchdog: TX not ACKed (mailbox stuck) -> abort + retry in %ums (%u/%u)",
-                      (unsigned)(J8108_HOLD_RETRY_MS * s_hold_fail), (unsigned)s_hold_fail, (unsigned)J8108_HOLD_RETRY_MAX);
-            }
-        }
-        else if ((s_dev->fb.rx_count > 0u) && ((t - s_dev->fb.last_rx_ms) > J8108_HOLD_FB_LOST_MS))
-        {
-            s_hold_fail++;
-            s_hold_retry_ms = t + (uint32_t)J8108_HOLD_RETRY_MS * (uint32_t)s_hold_fail;
-            act_result_set(ACTR_EN_NO_FB, t);
-            hold_exit(t, "feedback lost");
-            if (s_hold_fail >= J8108_HOLD_RETRY_MAX)
-            {
-                s_hold_want = 0u;
-                LOG_E("J8108", "HOLD watchdog: no feedback %u times -> stopped pinging (motor disabled/powered off?); press row0 to enable again",
-                      (unsigned)J8108_HOLD_RETRY_MAX);
-            }
-            else
-            {
-                LOG_W("J8108", "HOLD watchdog: no feedback for %ums -> retry in %ums (%u/%u)",
-                      (unsigned)J8108_HOLD_FB_LOST_MS, (unsigned)(J8108_HOLD_RETRY_MS * s_hold_fail),
-                      (unsigned)s_hold_fail, (unsigned)J8108_HOLD_RETRY_MAX);
-            }
-        }
-        else if (s_dev->fb.rx_count != s_hold_rx_seen)
-        {
-            s_hold_rx_seen = s_dev->fb.rx_count; /* 有进展 → 清零失败计数 */
-            if (s_hold_fail != 0u)
-            {
-                LOG_I("J8108", "HOLD: link healthy again (rx=%lu) -> failure counter reset",
-                      (unsigned long)s_dev->fb.rx_count);
-                s_hold_fail = 0u;
-            }
-        }
-    }
-}
-
-static CAN_HandleTypeDef *j8108_can(void)
-{
-    return (s_dev->can_instance != NULL) ? s_dev->can_instance->can_handle : NULL;
-}
-
-static void act_result_set(J8108_ActionResult_e r, uint32_t t)
-{
-    s_act_result = r;
-    s_act_result_ms = t;
-}
-
-static void j8108_action_poll(uint32_t t)
-{
-    EventBits_t bits;
-    KeyCore_Msg_t msg;
-    J8108_Action_t act;
-    uint8_t cooldown_ok;
-
-    /* ---- L3.5：发后 20ms 检查帧是否被任何节点 ACK（TX 邮箱是否已清空）----
-       本板 CAN1 配置 AutoRetransmission=ENABLE：无人应答时帧会**无限重传**，
-       进而把控制器推进总线错误 → 必须主动丢弃。 */
-    if ((s_pending != ACT_DO_NOTHING) && (s_ack_checked == 0u) && ((int32_t)(t - s_ack_dl_ms) >= 0))
-    {
-        CAN_HandleTypeDef *h = j8108_can();
-
-        s_ack_checked = 1u; /* 单次检查：否则每轮都会重复触发（实测踩过，导致 HOLD 反复重进）*/
-        if (j8108_tx_stuck(t, J8108_ACTION_ACK_MS) != 0u)
-        {
-            if (h != NULL)
-            {
-                (void)HAL_CAN_AbortTxRequest(h, CAN_TX_MAILBOX0 | CAN_TX_MAILBOX1 | CAN_TX_MAILBOX2);
-            }
-            act_result_set(ACTR_EN_NO_ACK, t);
-            LOG_W("J8108", "no ACK in %ums -> TX aborted (no node answered). check: motor 24V / CAN_H-L / 120R / CANID=0x%02X",
-                  J8108_ACTION_ACK_MS, J8108_CAN_ID);
-            s_pending = ACT_DO_NOTHING;
-        }
-        else if ((s_pending == ACT_ENABLE) && (J8108_HOLD_ON_ENABLE != 0u))
-        {
-            /* 使能帧被应答 → 进入 HOLD：本电机反馈是"响应式心跳"，不发控制帧就不回传；
-               同时以"纯阻尼"接管输出（torque=-Kd·v），避免使能后无指令的未知状态 */
-            s_hold_want = 1u;
-            s_hold_fail = 0u;
-            hold_enter(t, "enable ACKed");
-        }
-    }
-
-    /* ---- L4：发后 300ms 看反馈是否按预期变化（使能→出现反馈；失能→反馈停止）---- */
-    if ((s_pending != ACT_DO_NOTHING) && (s_ack_dl_ms == 0u) && ((int32_t)(t - s_confirm_dl_ms) >= 0))
-    {
-        uint32_t rx = s_dev->fb.rx_count;
-
-        if (s_pending == ACT_ENABLE)
-        {
-            if (rx > s_mark_rx)
-            {
-                act_result_set(ACTR_EN_OK, t);
-                LOG_I("J8108", "EN confirmed: feedback +%lu frames -> motor enabled, status now %s",
-                      (unsigned long)(rx - s_mark_rx), J8108_StatusStr(s_dev->status));
-            }
-            else
-            {
-                act_result_set(ACTR_EN_NO_FB, t);
-                LOG_W("J8108", "EN sent but NO feedback within %ums -> check motor 24V/CANID/wiring; status=%s",
-                      J8108_ACTION_CONFIRM_MS, J8108_StatusStr(s_dev->status));
-            }
-        }
-        else if (rx == s_mark_rx)
-        {
-            act_result_set(ACTR_DIS_OK, t);
-            LOG_I("J8108", "DIS confirmed: feedback stopped -> motor disabled");
-        }
-        else
-        {
-            act_result_set(ACTR_DIS_STILL_FB, t);
-            LOG_W("J8108", "DIS sent but feedback still arriving (+%lu) -> frame may have been dropped",
-                  (unsigned long)(rx - s_mark_rx));
-        }
-        s_pending = ACT_DO_NOTHING;
-    }
-
-    /* ---- 消费"长按松手"事件（本任务持有 HOLD_RELEASE/STUCK 位；UI 只消费 CLICK/DOUBLE）---- */
-    if (Key_EventGroup() == NULL)
-    {
-        return;
-    }
-    bits = xEventGroupWaitBits(Key_EventGroup(), KEY_BIT_HOLD_RELEASE | KEY_BIT_STUCK, pdTRUE, pdFALSE, 0);
-    if (bits == 0u)
-    {
-        return;
-    }
-    if ((bits & KEY_BIT_STUCK) != 0U)
-    {
-        LOG_E("J8108", "key STUCK -> action ignored (check PB2 hardware)");
-        return;
-    }
-
-    Key_GetLastMsg(&msg, NULL);
-    cooldown_ok = ((t - s_last_action_ms) >= J8108_ACTION_COOLDOWN_MS) ? 1u : 0u;
-    act = J8108_ActionDecide(Oled_UiGetCursorRow(), msg.hold_ms, cooldown_ok, s_dev->status);
-
-    switch (act)
-    {
-    case ACT_DO_NOTHING:
-        LOG_D("J8108", "hold %ums on a read-only row -> no action (silent by design)", (unsigned)msg.hold_ms);
-        break;
-    case ACT_REJECT_SHORT:
-        act_result_set(ACTR_SHORT, t);
-        LOG_I("J8108", "hold %ums < %ums -> not triggered", (unsigned)msg.hold_ms, J8108_ACTION_HOLD_MS);
-        break;
-    case ACT_REJECT_COOLDOWN:
-        act_result_set(ACTR_COOLDOWN, t);
-        LOG_W("J8108", "action rejected: cooldown %ums not elapsed", J8108_ACTION_COOLDOWN_MS);
-        break;
-    case ACT_REJECT_CAN:
-        act_result_set(ACTR_CAN_NOT_READY, t);
-        LOG_W("J8108", "action rejected: CAN status=%s (init fail or bus error)", J8108_StatusStr(s_dev->status));
-        break;
-    case ACT_ENABLE:
-    case ACT_DISABLE:
-        if (act == ACT_DISABLE)
-        {
-            s_hold_want = 0u; /* 用户要失能：不再保持控制流 */
-            s_hold_fail = 0u;
-            hold_exit(t, "disable requested"); /* 先停发控制帧，再发失能帧 */
-        }
-        J8108_SendCmd((act == ACT_ENABLE) ? J8108_CMD_ENABLE : J8108_CMD_DISABLE);
-        s_pending = act;
-        s_ack_checked = 0u;
-        s_mark_rx = s_dev->fb.rx_count;
-        s_last_action_ms = t;
-        s_ack_dl_ms = t + J8108_ACTION_ACK_MS;
-        s_confirm_dl_ms = t + J8108_ACTION_CONFIRM_MS;
-        act_result_set((act == ACT_ENABLE) ? ACTR_EN_SENT : ACTR_DIS_SENT, t);
-        LOG_I("J8108", "-> %s frame sent (hold %ums, ID 0x%03X); waiting ACK(%ums) + feedback(%ums)",
-              (act == ACT_ENABLE) ? "ENABLE" : "DISABLE", (unsigned)msg.hold_ms, J8108_CMD_ID,
-              J8108_ACTION_ACK_MS, J8108_ACTION_CONFIRM_MS);
-        break;
-    default:
-        break;
-    }
-}
-
-J8108_ActionResult_e J8108_LastAction(uint32_t *ms_age)
-{
-    if (ms_age != NULL)
-    {
-        *ms_age = (uint32_t)(now_ms() - s_act_result_ms);
-    }
-    return s_act_result;
-}
-
+/* ------------------------------ 任务主体 ------------------------------ */
 static void j8108_task(void *arg)
 {
-    uint32_t last_ctrl_ms = 0, last_print_ms = 0, last_log_ms = 0, last_fb_log_ms = 0;
+    uint32_t prev_ms = now_ms();
 
     (void)arg;
 
-    /* 注册 CAN 实例（0x781 反馈 → 回调） */
-    s_dev = J8108_Get();
-    J8108_Init(&hcan1);
-
     LOG_I("J8108", "========================================");
-    LOG_I("J8108", "8108 joint motor task | FW %s | build %s %s", FW_VERSION_STR, FW_BUILD_DATE, FW_BUILD_TIME);
-    LOG_I("J8108", "CAN1 1Mbps | motor CANID=0x%02X | CMD ID=0x%03X | MIT ID=0x%03X | FB ID=0x%03X",
-          J8108_CAN_ID, J8108_CMD_ID, J8108_MIT_ID, J8108_FB_ID);
-    LOG_I("J8108", "wiring check: CAN_H/L not swapped, motor 24V on, 120R switch ON");
-    LOG_I("J8108", "========================================");
+    LOG_I("J8108", "8108 joint motor control task | FW %s | proto v1 (serial-driven)", FW_VERSION_STR);
 
-    /* ---- 只监听模式（不发任何帧，电机安全） ---- */
-    if (J8108_AUTO_DEMO == 0u)
-    {
-        LOG_I("J8108", "MODE = MONITOR + KEY ACTION: no automatic TX. Only a %ums long-press on row0 sends enable/disable",
-              J8108_ACTION_HOLD_MS);
-        while (1)
-        {
-            uint32_t t;
-
-            J8108_Update();
-            t = now_ms();
-            j8108_link_debug(t);
-            j8108_action_poll(t);  /* M3：长按 → 动作（含 L2/L3.5/L4） */
-            j8108_hold_poll(t);    /* M4-a：HOLD 阻尼保持（周期 MIT 帧 = 让电机回传反馈的"心跳"）*/
-
-            if ((t - last_log_ms) >= J8108_LISTEN_LOG_MS)
-            {
-                last_log_ms = t;
-                /* 每 10s 一条状态摘要（低频；高频基础检测一律不打，用户要求"只打事件"）。
-                   **只有数据新鲜时才报数值**：链路断了坚决不打印旧数值（用户明确要求：
-                   "根本就没有新数据包进来，一直打印旧数据包有啥用"）*/
-                if (s_dev->fb.rx_count == 0u)
-                {
-                    LOG_I("J8108", "status=%s | rx=0 tx=%lu | no frame on bus (motor not connected/enabled) | waiting",
-                          J8108_StatusStr(s_dev->status), (unsigned long)s_dev->fb.tx_cnt);
-                }
-                else if ((t - s_dev->fb.last_rx_ms) < J8108_FB_TIMEOUT_MS)
-                {
-                    LOG_I("J8108", "status=%s | rx=%lu tx=%lu last_dt=%lums pos=%.2frad vel=%.2frad/s",
-                          J8108_StatusStr(s_dev->status), (unsigned long)s_dev->fb.rx_count,
-                          (unsigned long)s_dev->fb.tx_cnt, (unsigned long)(t - s_dev->fb.last_rx_ms),
-                          (double)s_dev->fb.pos, (double)s_dev->fb.vel);
-                }
-                else
-                {
-                    LOG_I("J8108", "status=%s | rx=%lu tx=%lu | link DOWN: no new frame for %lums (stale values not printed on purpose)",
-                          J8108_StatusStr(s_dev->status), (unsigned long)s_dev->fb.rx_count,
-                          (unsigned long)s_dev->fb.tx_cnt, (unsigned long)(t - s_dev->fb.last_rx_ms));
-                }
-            }
-
-#if J8108_FB_LOG_MS > 0u
-            /* 反馈流日志（M2 只读验证）：仅在**数据新鲜**时打印（>200ms 视为链路断：只靠 LOST 边沿 + 10s 摘要报，
-               不重复打印同一旧帧 —— 用户明确要求）*/
-            if ((s_dev->fb.rx_count > 0u) && ((t - s_dev->fb.last_rx_ms) < J8108_FB_TIMEOUT_MS) &&
-                ((t - last_fb_log_ms) >= J8108_FB_LOG_MS))
-            {
-                last_fb_log_ms = t;
-                LOG_I("J8108", "fb stream: pos=%.2frad(%.1fdeg) vel=%.2frad/s(%.0fRPM) T=%.3fNm Tm=%.1fC Tr=%.1fC age=%lums",
-                      (double)s_dev->fb.pos, (double)(s_dev->fb.pos / J8108_GEAR_RATIO * 57.29578f),
-                      (double)s_dev->fb.vel, (double)(s_dev->fb.vel * 9.54930f),
-                      (double)s_dev->fb.torque, (double)s_dev->fb.t_mos, (double)s_dev->fb.t_rotor,
-                      (unsigned long)(t - s_dev->fb.last_rx_ms));
-            }
+#if J8108_SCALE_OUTPUT_SIDE
+    LOG_I("J8108", "SCALE = OUTPUT-SIDE (dual-encoder doc): pos/vel are joint-side, NO /8. pmax=%.2frad(%.0fdeg) vmax=%.0f tmax=%.1f dir=%+.0f",
+          (double)J8108_P_HI, (double)(J8108_P_HI * J8108_RAD2DEG), (double)J8108_V_HI, (double)J8108_T_HI, (double)J8108_DIR);
+#else
+    LOG_I("J8108", "SCALE = MOTOR-SIDE fallback (single-encoder): output = pos / %.0f. pmax=%.2frad vmax=%.0f tmax=%.1f",
+          (double)J8108_GEAR_RATIO, (double)J8108_P_HI, (double)J8108_V_HI, (double)J8108_T_HI);
 #endif
+    LOG_I("J8108", "ctrl: CAN1 1Mbps | cmd 0x%03X | MIT 0x%03X | FB 0x%03X | %uHz frames | wd=%ums",
+          J8108_CMD_ID, J8108_MIT_ID, J8108_FB_ID, (unsigned)(1000u / J8108_CTRL_PERIOD_MS), (unsigned)s_params.wd_ms);
+    LOG_I("J8108", "limits: p[%.0f..%.0f]deg vmax=%.0fdps tmax=%.1fNm rate=%.0fdps2 | gains kd_damp=%.2f kp_pos=%.1f kd_pos=%.2f kp_v=%.3f ki_v=%.4f",
+          (double)s_params.pmin_deg, (double)s_params.pmax_deg, (double)s_params.vmax_dps, (double)s_params.tmax_nm,
+          (double)s_params.rate_dps2, (double)s_params.kd_damp, (double)s_params.kp_pos, (double)s_params.kd_pos,
+          (double)s_params.kp_v, (double)s_params.ki_v);
+    LOG_I("J8108", "SAFETY: enable via serial #EN only (no local button action). watchdog %ums -> DAMP (not disable). PB2 = UI only",
+          (unsigned)s_params.wd_ms);
+    LOG_I("J8108", "========================================");
 
-            vTaskDelay(1);
-        }
-    }
-
-    phase_enter(PH_IDLE);
-
-    while (1)
+    for (;;)
     {
         uint32_t t = now_ms();
-        uint32_t elapsed = t - s_phase_start_ms;
+        uint32_t dt = t - prev_ms;
 
-        J8108_Update(); /* raw → 物理量 */
-        j8108_link_debug(t);
+        stack_probe_tick(t, "J8108", J8108_TASK_STACK_WORDS); /* 栈余量自报（5s 一次） */
 
-        /* ---- 200Hz 控制帧 ---- */
-        if (t - last_ctrl_ms >= J8108_CTRL_PERIOD_MS)
+        prev_ms = t;
+        if (dt > s_dt_max_ms)
         {
-            last_ctrl_ms = t;
-            switch (s_phase)
-            {
-            case PH_ENABLE:
-            case PH_CHECK:
-            case PH_DAMP:
-            case PH_DAMP2:
-                J8108_SendMIT(0.0f, 0.0f, 0.0f, J8108_DAMP_KD, 0.0f); /* damping hold */
-                break;
-            case PH_SPIN_FWD:
-                J8108_SendMIT(0.0f, +J8108_SPIN_SPEED_RADS, 0.0f, J8108_DAMP_KD, 0.0f);
-                break;
-            case PH_SPIN_REV:
-                J8108_SendMIT(0.0f, -J8108_SPIN_SPEED_RADS, 0.0f, J8108_DAMP_KD, 0.0f);
-                break;
-            default:
-                break;
-            }
+            s_dt_max_ms = dt; /* 记录本窗口最大循环间隔（饿死/长阻塞会体现在这里） */
+        }
+        if (dt == 0u)
+        {
+            dt = 1u;
+        }
+        if (dt > 100u)
+        {
+            dt = 100u; /* 调度抖动/长阻塞保护：dt 上限 100ms，避免积分与速率限制算飞 */
         }
 
-        /* ---- 阶段推进 ---- */
-        switch (s_phase)
-        {
-        case PH_IDLE:
-            if (elapsed >= J8108_STARTUP_DELAY_MS)
-            {
-                J8108_SendCmd(J8108_CMD_ENABLE);
-                s_mark_count = s_dev->fb.rx_count;
-                s_try_cnt = 1;
-                LOG_I("J8108", "-> sent ENABLE frame FF FF FF FF FF FF FF FC (ID 0x%03X); watch RGB red->green", J8108_CMD_ID);
-                phase_enter(PH_ENABLE);
-            }
-            break;
-
-        case PH_ENABLE:
-        case PH_CHECK:
-            if (elapsed >= J8108_CHECK_MS)
-            {
-                if (s_dev->fb.rx_count > s_mark_count)
-                {
-                    LOG_I("J8108", "feedback OK (+%lu frames) -> CAN link verified",
-                          (unsigned long)(s_dev->fb.rx_count - s_mark_count));
-                    LOG_I("J8108", "-> DAMP hold (you may turn the output shaft by hand and watch numbers)");
-                    phase_enter(PH_DAMP);
-                }
-                else if (s_try_cnt < J8108_ENABLE_RETRY_MAX)
-                {
-                    s_try_cnt++;
-                    J8108_SendCmd(J8108_CMD_ENABLE);
-                    LOG_W("J8108", "no feedback yet -> resend ENABLE (attempt %lu)", (unsigned long)s_try_cnt);
-                    s_phase_start_ms = now_ms();
-                }
-                else
-                {
-                    LOG_E("J8108", "no feedback after %lu enable attempts. Check: 1) CAN_H/L wiring 2) motor 24V 3) 120R switch 4) motor CANID=0x01",
-                          (unsigned long)s_try_cnt);
-                    LOG_E("J8108", "-> DONE (no motion command sent, safe exit)");
-                    phase_enter(PH_DONE);
-                }
-            }
-            break;
-
-        case PH_DAMP:
-            if (elapsed >= J8108_DAMP_MS)
-            {
-                LOG_I("J8108", "-> SPIN_FWD %.2f rad/s (output shaft)", J8108_SPIN_SPEED_RADS);
-                phase_enter(PH_SPIN_FWD);
-            }
-            break;
-
-        case PH_SPIN_FWD:
-            if (elapsed >= J8108_SPIN_MS)
-            {
-                LOG_I("J8108", "-> SPIN_REV");
-                phase_enter(PH_SPIN_REV);
-            }
-            break;
-
-        case PH_SPIN_REV:
-            if (elapsed >= J8108_SPIN_MS)
-            {
-                LOG_I("J8108", "-> DAMP2");
-                phase_enter(PH_DAMP2);
-            }
-            break;
-
-        case PH_DAMP2:
-            if (elapsed >= J8108_DAMP2_MS)
-            {
-                J8108_SendCmd(J8108_CMD_DISABLE);
-                LOG_I("J8108", "-> sent DISABLE frame FF FF FF FF FF FF FF FD. Test done (reset board to rerun)");
-                phase_enter(PH_DONE);
-            }
-            break;
-
-        case PH_DONE:
-        default:
-            break;
-        }
-
-        /* ---- 反馈打印（运动阶段 500ms 一次） ---- */
-        if (t - last_print_ms >= J8108_PRINT_PERIOD_MS)
-        {
-            last_print_ms = t;
-            if (s_phase >= PH_DAMP && s_phase <= PH_DAMP2)
-            {
-                print_feedback();
-            }
-        }
+        J8108_Update();        /* 解算 + 状态 + 发布快照（供 UI/协议读） */
+        j8108_link_debug(t);   /* 边沿与低频摘要 */
+        j8108_req_poll(t);     /* 使能/失能/零点握手（含无 ACK 丢帧） */
+        j8108_mode_poll(t, dt);/* 心跳 + 保护 → @EVT */
+        j8108_frame_poll(t, dt);/* 生成 + 发送控制帧 + 帧看门狗 */
 
         vTaskDelay(1);
     }
@@ -684,14 +659,133 @@ static void j8108_task(void *arg)
 
 void J8108_Task_Init(void)
 {
-    BaseType_t ok = xTaskCreate(j8108_task, "J8108", J8108_TASK_STACK_WORDS, NULL, J8108_TASK_PRIORITY, &s_task_handle);
+    BaseType_t ok;
 
+    /* ★ 必须先做 CAN 注册（注册滤波器 + 启动控制器），否则状态恒为 INIT_FAIL、
+     *   既收不到反馈帧也发不出帧 —— 2026-09-18 重写时漏掉这一步导致实机 INIT FAIL。
+     *   J8108_Init 内部失败会打 E 级日志（CAN init FAILED ...）。 */
+    J8108_Init(&hcan1);
+
+    s_dev = J8108_Get();
+    Ctrl_ParamsDefault(&s_params);
+    Ctrl_Init(&s_ctrl, &s_params);
+
+    ok = xTaskCreate(j8108_task, "J8108", J8108_TASK_STACK_WORDS, NULL, J8108_TASK_PRIORITY, &s_task_handle);
     if (ok != pdPASS)
     {
-        LOG_E("J8108", "xTaskCreate FAILED (heap/stack?) -> MOTOR TASK DISABLED");
-    }
-    else
-    {
-        LOG_I("J8108", "task created (J8108, prio %u, stack %u words)", J8108_TASK_PRIORITY, J8108_TASK_STACK_WORDS);
+        LOG_E("J8108", "xTaskCreate FAILED (heap/stack?) -> MOTOR CONTROL DISABLED");
     }
 }
+
+/* --------------------------- 模块自检（#ST j8108 / #ST can） --------------------------- */
+uint8_t J8108_SelfTest(void)
+{
+    /* 非破坏性：只看"任务起没起来、设备注册没有"。是否使能/模式正常由 #STAT 反映，这里不重复判断。 */
+    if (s_task_handle == NULL)
+        return 3u; /* 控制任务没创建 → 电机控制整体失效（堆不足？看开机日志） */
+    if (J8108_Get() == NULL)
+        return 3u; /* CAN 设备未注册（J8108_Init 失败/设备表满） */
+    return 1u;
+}
+
+uint8_t J8108_CanSelfTest(void)
+{
+    const J8108_t *d = J8108_Get();
+
+    if (d == NULL)
+        return 3u;
+    switch (d->status)
+    {
+    case J8108_ST_READY:
+        return 1u; /* 收到过反馈帧：链路已建立 */
+    case J8108_ST_INIT_OK:
+        return 1u; /* 控制器已启动、还没等到节点（电机没上电 ≠ 故障） */
+    case J8108_ST_BUS_ERR:
+        return 2u; /* 总线错误：无应答/接线/终端电阻 */
+    default:
+        return 3u; /* INIT_FAIL：CAN 注册或启动就失败了 */
+    }
+}
+
+#else  /* !FEATURE_J8108 —— 服务模块的"显式停用桩"（设计取舍见 docs/日志_模块化改造.md M2） */
+/*
+ * 为什么这里不是 K3 那种"空对象"：
+ *   本模块的 API 被**通用协议层**（CmdRx）和 UI 层调用。编成空对象的话，那些调用点必须
+ *   逐个 #if 包住 —— 等于让协议层复制一份"电机命令表"，维护负担大于收益且容易漏。
+ *   折中：**不碰任何硬件**，但每个 API 都诚实回答"我没在跑"：
+ *     · 请求类  ：ReqStart 记录 → ReqResult 返回 J8108_RES_DISABLED → 协议层回 @ERR 4
+ *     · 设置类  ：空操作（系统里没有电机在动）
+ *     · 查询类  ：返回静态默认对象（UI/协议读取不崩）
+ *   纯硬件驱动（disp/sd/can 之类，不该被通用层调用）仍按 K3 编成空对象。
+ */
+static Ctrl_Params_t s_p_stub;
+static Ctrl_State_t s_s_stub;
+static uint8_t s_stub_ready = 0u;
+static volatile uint8_t s_stub_req = (uint8_t)J8108_REQ_NONE;
+
+static void stub_ready(void)
+{
+    if (s_stub_ready == 0u)
+    {
+        Ctrl_ParamsDefault(&s_p_stub);
+        Ctrl_Init(&s_s_stub, &s_p_stub);
+        s_stub_ready = 1u;
+    }
+}
+
+void J8108_Task_Init(void)
+{
+    stub_ready();
+    LOG_W("J8108", "module DISABLED by feature_config.h (stub active, NO CAN traffic, NO motion)");
+}
+
+void J8108_ReqStart(J8108_Req_e r, const char *why)
+{
+    (void)why;
+    s_stub_req = (uint8_t)r; /* 立即完成：ReqResult 会回 DISABLED，协议层据此回 @ERR 4 */
+}
+
+J8108_Res_e J8108_ReqResult(void)
+{
+    return (s_stub_req != (uint8_t)J8108_REQ_NONE) ? J8108_RES_DISABLED : J8108_RES_NONE;
+}
+
+void J8108_ReqClear(void) { s_stub_req = (uint8_t)J8108_REQ_NONE; }
+void J8108_KeepAlive(void) { }
+uint8_t J8108_IsEnabled(void) { return 0u; }
+uint8_t J8108_IsSending(void) { return 0u; }
+uint8_t J8108_SetMode(Ctrl_Mode_e m) { (void)m; return 0u; }
+void J8108_SetPosDeg(float deg) { (void)deg; }
+void J8108_SetVelDps(float dps) { (void)dps; }
+void J8108_SetVelTff(float tff) { (void)tff; }
+void J8108_SetTorqueNm(float nm) { (void)nm; }
+void J8108_SetImp(float kp, float kd, float tff) { (void)kp; (void)kd; (void)tff; }
+void J8108_SetDampKd(float kd) { (void)kd; }
+void J8108_SetRawMIT(float p_rad, float v_rps, float kp, float kd, float t_nm)
+{
+    (void)p_rad; (void)v_rps; (void)kp; (void)kd; (void)t_nm;
+}
+void J8108_StopSoft(void) { }
+void J8108_StopHard(void) { }
+const Ctrl_State_t *J8108_State(void) { stub_ready(); return &s_s_stub; }
+Ctrl_Params_t *J8108_Params(void) { stub_ready(); return &s_p_stub; }
+uint32_t J8108_EventLatch(void) { return 0u; }
+uint32_t J8108_LoopJitterTake(void) { return 0u; }
+
+void J8108_DbgFrames(float *kp, float *kd)
+{
+    if (kp != NULL) { *kp = 0.0f; }
+    if (kd != NULL) { *kd = 0.0f; }
+}
+
+uint8_t J8108_SelfTest(void)
+{
+    return 0u; /* 0 = 本固件未编译该模块（#ST 汇总行据此显示） */
+}
+
+uint8_t J8108_CanSelfTest(void)
+{
+    return 0u;
+}
+
+#endif /* FEATURE_J8108 */

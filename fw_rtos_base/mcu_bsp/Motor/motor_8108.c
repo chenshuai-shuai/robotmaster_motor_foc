@@ -26,10 +26,17 @@ static void j8108_tx(uint32_t std_id, const uint8_t *data)
     if (!s_inited)
         return;
 
+    /* ★ 自旋保护要"短"：本函数在 **prio 5 的控制任务**里每 5ms 调一次，
+     *   若邮箱长时间无空位（AutoRetransmission 无限重传会占死邮箱），长自旋会抢光 CPU
+     *   → 所有低级任务（串口回包/屏幕/LED）被饿死，现场表现就是"板子卡死"。
+     *   所以：最多空转 500 次（≈50µs）就放弃本帧；丢帧由上层看门狗（abort + 重试）处理。 */
     while (HAL_CAN_GetTxMailboxesFreeLevel(s_dev.can_instance->can_handle) == 0)
     {
-        if (++guard > 100000u)
-            return; /* 邮箱长时间无空位：丢弃本帧，绝不阻塞任务 */
+        if (++guard > 500u)
+        {
+            s_dev.tx_dropped++; /* 记一笔：屏/摘要可看，绝不静默 */
+            return;
+        }
     }
 
     hdr.StdId = std_id;
@@ -115,11 +122,12 @@ static uint16_t j8108_f2u(float v, float min, float max, uint8_t bits)
 
 void J8108_SendMIT(float p, float v, float kp, float kd, float t)
 {
-    uint16_t pu = j8108_f2u(p, J8108_P_MIN, J8108_P_MAX, 16);
-    uint16_t vu = j8108_f2u(v, J8108_V_MIN, J8108_V_MAX, 12);
-    uint16_t kpu = j8108_f2u(kp, J8108_KP_MIN, J8108_KP_MAX, 12);
-    uint16_t kdu = j8108_f2u(kd, J8108_KD_MIN, J8108_KD_MAX, 12);
-    uint16_t tu = j8108_f2u(t, J8108_T_MIN, J8108_T_MAX, 12);
+    /* 入参单位：**输出端** rad / rad·s⁻¹ / N·m（与反馈同口径）；正方向由 J8108_DIR 统一处理 */
+    uint16_t pu = j8108_f2u(p * J8108_DIR, J8108_P_LO, J8108_P_HI, 16);
+    uint16_t vu = j8108_f2u(v * J8108_DIR, J8108_V_LO, J8108_V_HI, 12);
+    uint16_t kpu = j8108_f2u(kp, J8108_KP_LO, J8108_KP_HI, 12);
+    uint16_t kdu = j8108_f2u(kd, J8108_KD_LO, J8108_KD_HI, 12);
+    uint16_t tu = j8108_f2u(t, J8108_T_LO, J8108_T_HI, 12);
     uint8_t d[8];
 
     d[0] = (uint8_t)(pu >> 8);
@@ -182,9 +190,11 @@ void J8108_Update(void)
     vel_raw = (uint16_t)((d[3] << 4) | (d[4] >> 4));
     t_raw = (uint16_t)(((d[4] & 0x0F) << 8) | d[5]);
 
-    s_dev.fb.pos = J8108_P_MIN + (float)pos_raw / 65535.0f * (J8108_P_MAX - J8108_P_MIN);
-    s_dev.fb.vel = J8108_V_MIN + (float)vel_raw / 4095.0f * (J8108_V_MAX - J8108_V_MIN);
-    s_dev.fb.torque = J8108_T_MIN + (float)t_raw / 4095.0f * (J8108_T_MAX - J8108_T_MIN);
+    /* 双编口径：POS/VEL 即输出端物理量（J8108_P_LO/HI 随 J8108_SCALE_OUTPUT_SIDE 切换），不做 ÷8 */
+    s_dev.fb.err = d[0]; /* byte0 = 报错位（bit7 过载 / bit6 线圈过温 / bit5 MOS 过温 / bit4 过流 / bit3 过压 / bit2 欠压） */
+    s_dev.fb.pos = J8108_P_LO + (float)pos_raw / 65535.0f * (J8108_P_HI - J8108_P_LO);
+    s_dev.fb.vel = J8108_V_LO + (float)vel_raw / 4095.0f * (J8108_V_HI - J8108_V_LO);
+    s_dev.fb.torque = J8108_T_LO + (float)t_raw / 4095.0f * (J8108_T_HI - J8108_T_LO);
     s_dev.fb.t_mos = (float)d[6] * 100.0f / 255.0f;
     s_dev.fb.t_rotor = (float)d[7] * 100.0f / 255.0f;
 
@@ -213,6 +223,7 @@ void J8108_Update(void)
     s_snap.valid = (s_dev.fb.rx_count > 0u) ? 1u : 0u;
     s_snap.status = s_dev.status;
     s_snap.init_ok = s_dev.init_ok;
+    s_snap.err = s_dev.fb.err;
     s_snap.bus_err = s_dev.bus_err;
     s_snap.rx_count = s_dev.fb.rx_count;
     s_snap.tx_cnt = s_dev.fb.tx_cnt;
@@ -220,12 +231,59 @@ void J8108_Update(void)
     s_snap.pos = s_dev.fb.pos;
     s_snap.vel = s_dev.fb.vel;
     s_snap.torque = s_dev.fb.torque;
-    s_snap.pos_out_deg = s_dev.fb.pos / J8108_GEAR_RATIO * 57.29578f;
+    /* 双编口径：pos/vel 已是输出端，直接换算工程单位（不除减速比） */
+    s_snap.pos_deg = s_dev.fb.pos * J8108_RAD2DEG;
+    s_snap.vel_dps = s_dev.fb.vel * J8108_RAD2DEG;
     s_snap.vel_rpm = s_dev.fb.vel * 9.54930f;
     s_snap.t_mos = s_dev.fb.t_mos;
     s_snap.t_rotor = s_dev.fb.t_rotor;
     s_snap.seq = s_snap_seq + 1u;
     s_snap_seq++;
+}
+
+/* ---- TX 邮箱是否"连续占用"超过 limit_ms = 无人 ACK（相位 1=正在发送，不算） ---- */
+static uint8_t s_tx_busy = 0u;
+static uint32_t s_tx_busy_ms = 0u;
+
+uint8_t J8108_TxStuck(uint32_t now_ms, uint32_t limit_ms)
+{
+    if (!s_inited)
+    {
+        return 0u;
+    }
+    if (HAL_CAN_GetTxMailboxesFreeLevel(s_dev.can_instance->can_handle) < 3u)
+    {
+        if (s_tx_busy == 0u)
+        {
+            s_tx_busy = 1u;
+            s_tx_busy_ms = now_ms;
+        }
+        return ((uint32_t)(now_ms - s_tx_busy_ms) >= limit_ms) ? 1u : 0u;
+    }
+    s_tx_busy = 0u;
+    return 0u;
+}
+
+/* ---- 报错位短标签（屏/协议显示；无错返回 "OK"） ---- */
+const char *J8108_ErrStr(uint8_t err)
+{
+    if (err == 0u)
+    {
+        return "OK";
+    }
+    if ((err & J8108_ERR_OVERLOAD) != 0u)
+        return "OVERLOAD";
+    if ((err & J8108_ERR_TP_COIL) != 0u)
+        return "T-COIL";
+    if ((err & J8108_ERR_TP_MOS) != 0u)
+        return "T-MOS";
+    if ((err & J8108_ERR_OC) != 0u)
+        return "OVERCUR";
+    if ((err & J8108_ERR_OV) != 0u)
+        return "OVERVOLT";
+    if ((err & J8108_ERR_UV) != 0u)
+        return "UNDERVOLT";
+    return "ERR?";
 }
 
 const char *J8108_StatusStr(uint8_t status)

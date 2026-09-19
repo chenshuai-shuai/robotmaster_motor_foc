@@ -19,10 +19,12 @@
 
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
+#include "fault_log.h"  /* 崩溃黑匣子（RTC 备份寄存器） */
 #include "sd_sdio.h"
 #include "stm32f4xx_it.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "feature_config.h"   /* M3：文件级隔离开关 */
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 /* USER CODE END Includes */
@@ -105,6 +107,8 @@ void HardFault_Handler(void)
   s_hf_psp  = (uint32_t)__get_PSP();
   s_hf_cfsr = SCB->CFSR;
   s_hf_hfsr = SCB->HFSR;
+  /* ★ 黑匣子：写进 RTC 备份寄存器（复位不清）→ 下次开机由 FaultLog_InitAndReport() 报出 */
+  FaultLog_Store((uint32_t)1u /*HARDFAULT*/, s_hf_pc, s_hf_lr, s_hf_cfsr);
   /* 红 LED 快闪指示 HardFault */
   HAL_GPIO_WritePin(GPIOE, GPIO_PIN_11, GPIO_PIN_RESET);
   while (1)
@@ -289,6 +293,7 @@ void USART6_IRQHandler(void)
 
 /* USER CODE END 1 */
 
+#if FEATURE_SD_CARD   /* M3 文件级隔离：SD 关闭时这三个中断处理器不参与编译（向量表回落到弱定义的死循环，且 SD 从未使能中断，安全） */
 /* SDIO 中断：转发给 sd_sdio.c（SD 卡 4-bit 传输） */
 void SDIO_IRQHandler(void)
 {
@@ -311,3 +316,5 @@ void DMA2_Stream3_IRQHandler(void)
 {
   SD_SDIO_DMA_RX_IRQHandler();
 }
+
+#endif /* FEATURE_SD_CARD */

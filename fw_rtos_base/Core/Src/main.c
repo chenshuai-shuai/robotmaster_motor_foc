@@ -40,8 +40,12 @@
 #include "sys_status.h"
 #include "sd_cli.h"
 #include "feature_config.h"   /* 功能开关（宏裁剪无关功能） */
-#include "J8108_Task.h"       /* 8108 关节电机任务（CAN1） */
-#include "bsp_key.h"          /* 板载按键 PB2 事件机 */
+#include "J8108_Task.h"       /* 8108 关节电机控制任务（CAN1，控制帧发生器） */
+#include "bsp_key.h"          /* 板载按键 PB2 事件机（纯 UI：翻页） */
+#include "CmdRx_Task.h"       /* 串口协议接收/解析/分派（协议 v1） */
+#include "Monitor_Task.h"     /* 低频监控：屏刷 10Hz + 日志 1Hz + 遥测 */
+#include "proto_tx.h"         /* 协议统一发送口（互斥锁） */
+#include "fault_log.h"        /* 崩溃黑匣子（复位后自报死因） */
 extern void UART10_Init(void);
 /* USER CODE END Includes */
 
@@ -66,6 +70,14 @@ int calculate_rpm(float desired_velocity) {
 
 /* USER CODE END PM */
 
+/* ★ 编译期告警：安全性模块被关闭必须显式可见（规范 R7）。
+ * 刻意只放在 main.c（组装根，全工程只编译一次）——放在共享头里会在每个 include 它的
+ * 编译单元各报一次（M3 实测 DISP_DEV 变成 18 条同文告警，噪声会淹没真问题）。
+ * 运行时还有第二道保险：开机 @BOOT 横幅里的 j8108:0。 */
+#if !FEATURE_J8108
+#warning "J8108 disabled: motor control and protection are OFF (this build has no motor module)"
+#endif
+
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
@@ -82,6 +94,13 @@ void MX_FREERTOS_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+/* ---- 上次运行是怎么死的？（崩点记录在 .bss，软复位不清零 → 开机自报，免调试器）----
+ * 由 stm32f4xx_it.c 的 HardFault_Handler 与 freertos.c 的 vApplicationStackOverflowHook 记录 */
+extern volatile uint32_t s_hf_pc, s_hf_lr, s_hf_cfsr, s_hf_hfsr;
+extern char s_overflow_task[16];
+extern volatile uint32_t s_overflow_cfsr;
+static void report_previous_fault(void);
+/* USER CODE END 0 */
 
 /* USER CODE END 0 */
 
@@ -136,9 +155,20 @@ int main(void)
   UART10_Init();            /* 日志串口必须先于 LED 任务（任务里 printf 依赖 uart10） */
   LOG_I("fw", "=== firmware %s (release %s, built %s %s) ===",
         FW_VERSION_STR, FW_RELEASE_STR, FW_BUILD_DATE, FW_BUILD_TIME);  /* 双版本标识 */
-  LOG_I("fw", "features: J8108=%u KEY=%u OLED=%u LED=%u | SD=%u CLI=%u CAR=%u | verbose_log=%u",
-        FEATURE_J8108, FEATURE_KEY, FEATURE_OLED_UI, FEATURE_LED_TASK,
+  /* 机器可读开机横幅（profile + 模块清单）：台架脚本据此断言"烧进去的组合 = 想跑的组合"，
+   * 防"以为开了其实没开" —— 见 docs/规范_功能宏与模块化.md §6。
+   * 注意：日志单条格式化缓冲 LOG_FMT_BUF_SIZE=128 会截断超长行（M1 实测），
+   *       所以**拆成两行**，两行都以 @BOOT 开头便于脚本拼接（改这里要同步改 check_profiles 断言）。 */
+  LOG_I("fw", "@BOOT profile=%s fw=%s disp=%s", BOOT_PROFILE_NAME, FW_VERSION_STR, DISP_DRIVER_NAME);
+  LOG_I("fw", "@BOOT mods=j8108:%u,key:%u,monitor:%u,serial:%u,led:%u,sd:%u,cli:%u,car:%u,vlog:%u",
+        FEATURE_J8108, FEATURE_KEY, FEATURE_MONITOR_TASK, FEATURE_SERIAL_CTRL, FEATURE_LED_TASK,
         FEATURE_SD_CARD, FEATURE_SD_CLI, FEATURE_CAR_TASKS, FEATURE_VERBOSE_LOG);
+  report_previous_fault();  /* ★ 上次是不是崩了？崩在哪？——开机就报（不用接调试器） */
+
+  /* 协议发送口：**与显示无关**（@OK/@ERR/@EVT/@TEL 四个出口共用一把锁），任何会发 @ 行的
+   * 模块都依赖它 → 必须无条件初始化。M1 抓到的真实缺陷：它原先嵌在 OLED 宏里，换成
+   * "有电机无屏"组合（PROFILE_MOTOR_DEV）会被跳过 → Proto_Send 因 s_tx_mtx==NULL 静默丢回包。 */
+  Proto_TxInit();
 
 #if FEATURE_SD_CLI
   SD_CLI_Init();             /* SD 卡命令行（uart10 接收回调注册） */
@@ -146,9 +176,11 @@ int main(void)
 #if FEATURE_LED_TASK
   Led_Task_Init();          /* LED 流水灯任务 */
 #endif
-#if FEATURE_OLED_UI
+#if FEATURE_DISP_UI
   OLED_Init();              /* OLED 显示屏（软件I2C：PB10=SCL/PB9=SDA，地址0x78） */
-  Oled_Task_Init();         /* 单页监护界面任务 */
+#if FEATURE_MONITOR_TASK
+  Monitor_Task_Init();      /* 低频监控任务：屏刷 10Hz + 日志 1Hz + 遥测（三层同源快照） */
+#endif
 #endif
 #if FEATURE_SD_CARD
   SdCard_Task_Init();
@@ -157,7 +189,13 @@ int main(void)
   xTaskCreate(SD_CLI_TaskEntry, "CliTask", 512, NULL, 3, NULL);  /* SD 命令行任务 */
 #endif
 #if FEATURE_J8108
-  J8108_Task_Init();        /* 8108 关节电机（CAN1；默认仅监听，不发帧） */
+  J8108_Task_Init();        /* 8108 关节电机（CAN1；控制帧发生器：串口驱动模式/设定点） */
+#endif
+
+#if FEATURE_SERIAL_CTRL
+  CmdRx_Task_Init();        /* 串口协议（USART6 与日志同口：# 命令 / @ 回包，靠前缀隔离）
+                             * 依赖：uart10 + Proto_TxInit（两者已在上方初始化）；
+                             * **不依赖电机** → 单独用 SERIAL_CTRL 门控（屏调试组合也要能收命令） */
 #endif
 #if FEATURE_KEY
   Key_Task_Init();          /* 板载按键 PB2（10ms 扫描 + 事件机） */
@@ -313,6 +351,30 @@ void SystemClock_Config(void)
 }
 
 /* USER CODE BEGIN 4 */
+/* 上次运行的死因自报（日志串口已就绪；报告完清零，保证下次崩溃能重新记录） */
+static void report_previous_fault(void)
+{
+    if (s_hf_pc != 0u)
+    {
+        LOG_E("fault", "PREVIOUS RUN ENDED IN HARD FAULT: PC=0x%08lX LR=0x%08lX CFSR=0x%08lX HFSR=0x%08lX",
+              (unsigned long)s_hf_pc, (unsigned long)s_hf_lr, (unsigned long)s_hf_cfsr, (unsigned long)s_hf_hfsr);
+        s_hf_pc = 0u;
+        s_hf_lr = 0u;
+        s_hf_cfsr = 0u;
+        s_hf_hfsr = 0u;
+    }
+    if (s_overflow_task[0] != '\0')
+    {
+        LOG_E("fault", "PREVIOUS RUN HIT STACK OVERFLOW in task '%s' (CFSR=0x%08lX) -> raise that task's stack!",
+              s_overflow_task, (unsigned long)s_overflow_cfsr);
+        s_overflow_task[0] = '\0';
+        s_overflow_cfsr = 0u;
+    }
+
+    /* ★ 第二条路径：复位后仍保留的黑匣子（RTC 备份寄存器）——断电才会丢 */
+    FaultLog_InitAndReport();
+}
+/* USER CODE END 4 */
 
 /* USER CODE END 4 */
 

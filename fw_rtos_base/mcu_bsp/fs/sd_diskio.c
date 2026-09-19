@@ -10,6 +10,12 @@
 #include "bsp_log.h"
 #include <string.h>
 #include "sd_sdio.h"
+#include "feature_config.h"   /* M3：文件级隔离需要一个统一的开关 */
+
+
+#if FEATURE_SD_CARD
+/* M3 文件级隔离（docs/规范_功能宏与模块化.md R3）：未启用时本文件编译为空对象。
+ * 被谁调用必须由调用点用同一个宏保护（忘保护=链接失败，这是刻意设计的 fail-fast）。 */
 
 /* 驱动器号 0 的状态 */
 static volatile DSTATUS s_stat = STA_NOINIT;
@@ -167,3 +173,5 @@ DRESULT disk_ioctl(BYTE pdrv, BYTE cmd, void *buff)
             return RES_PARERR;
     }
 }
+
+#endif /* FEATURE_SD_CARD */

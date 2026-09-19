@@ -19,20 +19,27 @@
   */
 
 #include "main.h"
+#include "board_config.h" /* 板级引脚常量（K5） */
 #include "OLED.h"
 #include "bsp_log.h"
 #include <string.h>
 #include <math.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include "feature_config.h"   /* M3：文件级隔离需要一个统一的开关 */
+
+
+#if FEATURE_DISP_SH1106_I2C
+/* M3 文件级隔离（docs/规范_功能宏与模块化.md R3）：未启用时本文件编译为空对象。
+ * 被谁调用必须由调用点用同一个宏保护（忘保护=链接失败，这是刻意设计的 fail-fast）。 */
 /*移植配置*********************/
 
 /*引脚与地址宏定义（集中在此修改，软件I2C）*/
 /*SCL = PB10，SDA = PB9；开漏输出，上拉由外部硬件提供*/
-#define OLED_SCL_GPIO_Port	GPIOB
-#define OLED_SCL_Pin		GPIO_PIN_10
-#define OLED_SDA_GPIO_Port	GPIOB
-#define OLED_SDA_Pin		GPIO_PIN_9
+#define OLED_SCL_GPIO_Port	BRD_SCR_I2C_SCL_PORT
+#define OLED_SCL_Pin		BRD_SCR_I2C_SCL_PIN
+#define OLED_SDA_GPIO_Port	BRD_SCR_I2C_SDA_PORT
+#define OLED_SDA_Pin		BRD_SCR_I2C_SDA_PIN
 
 /*I2C从机地址：0x78（7位地址0x3C左移1位后的写地址）；部分模块为0x7A*/
 #define OLED_I2C_ADDRESS	0x78
@@ -183,7 +190,7 @@ void OLED_GPIO_Init(void)
 	GPIO_InitStructure.Mode = GPIO_MODE_OUTPUT_OD;
 	GPIO_InitStructure.Pull = GPIO_NOPULL;
 	GPIO_InitStructure.Speed = GPIO_SPEED_FREQ_HIGH;
-	HAL_GPIO_Init(GPIOB, &GPIO_InitStructure);
+	HAL_GPIO_Init(OLED_SCL_GPIO_Port, &GPIO_InitStructure);
 	
 	/*释放SCL和SDA*/
 	OLED_W_SCL(1);
@@ -1467,3 +1474,5 @@ void OLED_DrawArc(uint8_t X, uint8_t Y, uint8_t Radius, int16_t StartAngle, int1
 
 /*****************江协科技|版权所有****************/
 /*****************jiangxiekeji.com*****************/
+
+#endif /* FEATURE_DISP_SH1106_I2C */

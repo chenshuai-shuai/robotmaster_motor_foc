@@ -124,14 +124,19 @@ int main(void){
   CK(cap_id==0x201, "MIT frame ID=0x201"); CK(dev->fb.tx_cnt==tx0+1u, "tx_cnt++");
   p=(uint16_t)((cap[0]<<8)|cap[1]); v=(uint16_t)((cap[2]<<4)|(cap[3]>>4)); kd=(uint16_t)((cap[5]<<4)|(cap[6]>>4));
   CK(cap[2]==0x9C, "v=10 high byte 0x9C (doc)"); CK(kd==0x333, "Kd=1 = 0x333 (doc)");
-  CK(fabsf(d16(p,-25.12f,25.12f))<0.002f, "decode p ~ 0"); CK(fabsf(d12(v,-45.0f,45.0f)-10.0f)<0.05f, "decode v ~ 10");
+  CK(fabsf(d16(p,-12.56f,12.56f))<0.002f, "decode p ~ 0 (dual-encoder +-12.56rad)"); CK(fabsf(d12(v,-45.0f,45.0f)-10.0f)<0.05f, "decode v ~ 10");
   memcpy(dev->fb.raw,fb,8); J8108_Update();
-  CK(fabsf(dev->fb.pos+0.0678f)<0.005f, "fb POS ~ -0.069rad (doc)");
+  CK(fabsf(dev->fb.pos+0.0345f)<0.005f, "fb POS ~ -0.0345rad (dual-encoder doc: +-12.56rad)");
+  CK(dev->fb.err==0x01u, "fb byte0 = ERR bits (dual-encoder doc)");
+  CK(strcmp(J8108_ErrStr(0x00u), "OK")==0 && strcmp(J8108_ErrStr(0x40u), "T-COIL")==0 &&
+     strcmp(J8108_ErrStr(0x80u), "OVERLOAD")==0, "ERR bit -> label");
   CK(fabsf(dev->fb.torque-0.198f)<0.01f, "fb T ~ 0.198Nm (doc)");
   CK(fabsf(dev->fb.t_mos-29.41f)<0.2f, "fb TMos ~ 29.41C (doc)");
   CK(fabsf(dev->fb.t_rotor-26.67f)<0.2f, "fb TMotor ~ 26.67C (doc)");
   J8108_SendMIT(0.0f,100.0f,0.0f,0.0f,0.0f); v=(uint16_t)((cap[2]<<4)|(cap[3]>>4));
   CK(v==0x0FFF, "v=100 clamped to 0xFFF");
+  J8108_SendMIT(0.1f,0.0f,0.0f,0.0f,0.0f); p=(uint16_t)((cap[0]<<8)|cap[1]);
+  CK(fabsf(d16(p,-12.56f,12.56f)-0.1f)<0.01f, "MIT encode round-trip at +0.1rad (dual-encoder range)");
   /* ---- CAN 状态机（屏上四态的数据源：INIT FAIL / INIT OK / READY / BUS ERR）---- */
   J8108_Init(&h); dev=J8108_Get(); J8108_Update();
   CK(dev->init_ok==1u, "status: init_ok=1 after CANRegister");
@@ -153,8 +158,8 @@ int main(void){
     CK(s1.valid==1u && s1.seq>0u && ((s1.seq%2u)==0u), "snapshot: valid=1 & even seq");
     CK(memcmp(s1.raw,fb,8)==0, "snapshot: raw[8] belongs to the SAME frame as decoded values");
     CK(fabsf(s1.pos-dev->fb.pos)<1e-6f, "snapshot: pos mirrors driver");
-    CK(fabsf(s1.pos_out_deg-(dev->fb.pos/8.0f*57.29578f))<0.01f, "snapshot: output deg = pos/8 (gear 8:1)");
-    CK(fabsf(s1.vel_rpm-(dev->fb.vel*9.54930f))<0.01f, "snapshot: RPM conversion");
+    CK(fabsf(s1.pos_deg-(dev->fb.pos*57.29578f))<0.01f, "snapshot: deg = pos x RAD2DEG (output side, no /8)");
+    CK(fabsf(s1.vel_dps-(dev->fb.vel*57.29578f))<0.01f, "snapshot: dps = vel x RAD2DEG");
     CK(s1.status==dev->status && s1.rx_count==dev->fb.rx_count, "snapshot: status & counters mirrored");
     J8108_CopySnapshot(&s2);
     CK(s2.seq==s1.seq, "snapshot: seq stable across reads when no writer");
@@ -186,36 +191,224 @@ STUBS = {
                  'CANInstance *CANRegister(CAN_Init_Config_s *config);\n#endif\n',
 }
 
-# ---- M3 动作策略层（j8108_action.h 纯逻辑头）宿主机测试 ----
-ACTION_TEST = r"""
+# ---- 纯逻辑层宿主机测试：命令行解析 / 控制核 / 按键 UI 策略 ----
+CMD_TEST = r"""
 #include "stdio.h"
 #include "string.h"
-#include "j8108_action.h"
+#include "cmd_parse.h"
+static int F;
+#define CK(c, m) do { if (c) printf("  PASS  %s\n", m); else { printf("  FAIL  %s\n", m); F++; } } while (0)
+static Cmd_ParseRes_e P(const char *s, Cmd_t *c) { return Cmd_ParseLine(s, (uint16_t)strlen(s), c); }
+int main(void)
+{
+    Cmd_t c;
+    float v;
+
+    CK(P("#PING", &c) == CMD_PARSE_OK && c.id == CMD_PING, "#PING recognized");
+    CK(P("#ping", &c) == CMD_PARSE_OK && c.id == CMD_PING, "command name case-insensitive");
+    CK(P("#V 90", &c) == CMD_PARSE_OK && c.nf == 1u && c.f[0] > 89.9f && c.f[0] < 90.1f, "#V 90 -> 1 numeric arg");
+    CK(P("#P -168.75 20 1.0", &c) == CMD_PARSE_OK && c.nf == 3u && c.f[0] < -168.7f && c.f[0] > -168.8f, "#P 3 args (negative decimal)");
+    CK(P("#MODE POS", &c) == CMD_PARSE_OK && c.nw == 1u && cmd_word_is(&c, 0u, "pos") == 1u, "#MODE POS -> keyword (ci compare)");
+    CK(P("#SET kd_damp 1.25", &c) == CMD_PARSE_OK && c.nw == 1u && cmd_word_is(&c, 0u, "KD_DAMP") == 1u && c.f[0] > 1.24f, "#SET key+value");
+    CK(P("#LIM P -170 170", &c) == CMD_PARSE_OK && c.nw == 1u && c.nf == 2u, "#LIM P min max");
+    CK(P("#SETP 0.1 -2.5 20 1 0.5", &c) == CMD_PARSE_OK && c.nf == 5u, "#SETP needs 5 numeric args");
+    CK(P("[j8108] I: a log line", &c) == CMD_PARSE_NOTCMD, "log line -> NOTCMD (ignored)");
+    CK(P("@TEL ms=1", &c) == CMD_PARSE_NOTCMD, "@reply line -> NOTCMD");
+    CK(P("#NOPE", &c) == CMD_PARSE_UNKNOWN, "unknown -> UNKNOWN (@ERR 1)");
+    CK(P("#V 1.2.3", &c) == CMD_PARSE_BADARG, "malformed number -> BADARG (@ERR 2)");
+    CK(P("#V 1e3", &c) == CMD_PARSE_BADARG, "exponent unsupported -> BADARG");
+    CK(P("#V", &c) == CMD_PARSE_OK && c.nf == 0u, "#V no args parses (dispatcher rejects)");
+    CK(P("#V 1 2 3 4 5 6 7", &c) == CMD_PARSE_BADARG, "too many numeric args -> BADARG");
+    CK(P("#V -0.5", &c) == CMD_PARSE_OK && c.f[0] < 0.0f, "negative arg");
+    CK(cmd_atof("0", 1u, &v) == 1u && v == 0.0f, "atof zero");
+    CK(cmd_atof("-.5", 3u, &v) == 1u && v < -0.49f && v > -0.51f, "atof -.5");
+    CK(cmd_atof("100.", 4u, &v) == 1u && v > 99.9f, "atof trailing dot");
+    CK(cmd_atof("", 0u, &v) == 0u, "atof empty -> fail");
+    printf("  ==> %s (fail=%d)\n", F ? "FAIL" : "ALL PASS", F);
+    return F ? 1 : 0;
+}
+"""
+
+CTRL_TEST = r"""
+#include "stdio.h"
+#include "string.h"
+#include "ctrl_core.h"
+static int F;
+#define CK(c, m) do { if (c) printf("  PASS  %s\n", m); else { printf("  FAIL  %s\n", m); F++; } } while (0)
+static float fa(float v) { return (v < 0.0f) ? -v : v; }
+static const float D2R = 0.017453292f;
+int main(void)
+{
+    Ctrl_Params_t p;
+    Ctrl_State_t s;
+    Ctrl_Frame_t f;
+    int i;
+    uint16_t e;
+
+    Ctrl_ParamsDefault(&p);
+    Ctrl_Init(&s, &p);
+
+    CK(p.wd_ms == 200u && p.kd_damp == 1.0f && p.kp_pos == 20.0f && p.tmax_nm == 7.5f && p.setp_unlocked == 0u &&
+       p.kp_v <= 0.01f && p.trate_nm_s > 0.0f,
+       "defaults: wd=200 kd_damp=1 kp_pos=20 tmax=7.5 setp locked + kp_v<=0.01 + trate>0 (bench-safe)");
+
+    Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f);
+    CK(f.send == 0u, "disabled+IDLE -> no frame");
+    s.enabled = 1u;
+    Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f);
+    CK(f.send == 0u, "enabled but IDLE -> still no frame (no TX when idle)");
+
+    Ctrl_SetMode(&s, CTRL_MODE_DAMP, 10.0f, 0.0f);
+    Ctrl_Step(&s, &p, 10.0f, 0.0f, 5u, &f);
+    CK(f.send == 1u && f.kp == 0.0f && f.kd == p.kd_damp && f.t_nm == 0.0f, "DAMP: kp=0 kd=1 t=0 (pure damping)");
+
+    Ctrl_SetMode(&s, CTRL_MODE_POS, 12.5f, 0.0f);
+    CK(fa(s.set_applied - 12.5f) < 0.01f, "POS enter: setpoint preset to current angle (no jump)");
+    Ctrl_SetPos(&s, 90.0f);
+    Ctrl_Step(&s, &p, 12.5f, 0.0f, 10u, &f);
+    CK(f.kp == p.kp_pos && f.kd == p.kd_pos, "POS: Kp AND Kd both sent (doc: Kp w/o Kd oscillates)");
+    CK(fa(f.p_rad - 90.0f * D2R) > 0.1f, "POS: slew-limited (not instant jump)");
+    for (i = 0; i < 200; i++) { Ctrl_Step(&s, &p, 12.5f, 0.0f, 10u, &f); }
+    CK(fa(f.p_rad - 90.0f * D2R) < 0.01f, "POS: reaches target after slew");
+    Ctrl_SetPos(&s, 9999.0f);
+    for (i = 0; i < 600; i++) { Ctrl_Step(&s, &p, 12.5f, 0.0f, 10u, &f); }
+    CK(fa(f.p_rad - p.pmax_deg * D2R) < 0.01f, "POS: clamped to soft limit pmax");
+    CK((s.ev & CTRL_EV_LIMIT) != 0u, "LIMIT event raised when setpoint is clamped");
+    Ctrl_SetMode(&s, CTRL_MODE_POS, 100.0f, 0.0f);
+    Ctrl_SetPos(&s, 100.5f);
+    Ctrl_Step(&s, &p, 100.0f, 0.0f, 10u, &f);
+    CK(s.inpos == 1u, "POS: inpos asserted inside band");
+
+    Ctrl_SetMode(&s, CTRL_MODE_TORQUE, 0.0f, 0.0f);
+    Ctrl_SetTorque(&s, 99.0f);
+    Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f);
+    CK(fa(f.t_nm) < 1.0f, "TORQUE: first step is rate-limited (no instant 7.5Nm kick)");
+    for (i = 0; i < 200; i++) { Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f); }
+    CK(fa(f.t_nm - p.tmax_nm) < 0.001f && f.kp == 0.0f && f.kd == 0.0f, "TORQUE: reaches and holds tmax after slew, kp=kd=0");
+
+    /* ★ 力矩斜率限制（实机 2026-09-18 抖动修复的核心） */
+    Ctrl_Init(&s, &p); s.enabled = 1u; Ctrl_SetMode(&s, CTRL_MODE_TORQUE, 0.0f, 0.0f);
+    Ctrl_SetTorque(&s, 7.5f);
+    Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f);
+    CK(fa(f.t_nm - (p.trate_nm_s * 0.005f)) < 0.001f, "TRATE: torque step limited to trate*dt (=0.1Nm @200Hz)");
+
+    /* ★ 事件边沿锁存：持续夹紧只报一次（防 @EVT 洪泛占满串口） */
+    {
+        int hits = 0;
+        Ctrl_Init(&s, &p); s.enabled = 1u; Ctrl_SetMode(&s, CTRL_MODE_TORQUE, 0.0f, 0.0f);
+        Ctrl_SetTorque(&s, 7.5f);
+        for (i = 0; i < 50; i++) { Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f); if ((Ctrl_TakeEvents(&s) & CTRL_EV_LIMIT) != 0u) { hits++; } }
+        CK(hits == 1, "LIMIT latched: 50 clamped cycles -> exactly 1 event (was: 50 events/250ms)");
+    {
+        /* ★ 关键回归（实机 2026-09-18）：斜率限制"时紧时松"会反复解锁纯边沿锁存 → 刷屏。
+         *   抖动 50 次（夹紧/不夹紧交替）必须只出 1 条事件。 */
+        int hits = 0;
+        Ctrl_Init(&s, &p); s.enabled = 1u; Ctrl_SetMode(&s, CTRL_MODE_TORQUE, 0.0f, 0.0f);
+        Ctrl_SetTorque(&s, 7.5f);
+        int pre = 0;
+        Ctrl_SetTorque(&s, 1.0f);
+        for (i = 0; i < 60; i++) { Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f); (void)Ctrl_TakeEvents(&s); } /* 先收敛并清事件 */
+        for (i = 0; i < 100; i++) {
+            /* 真实抖动模型：目标交替"斜率内(不夹紧)"与"超斜率(夹紧)" → 每 5ms 翻转一次 */
+            Ctrl_SetTorque(&s, ((i % 2) == 0) ? 1.05f : 1.60f);
+            Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f);
+            if ((Ctrl_TakeEvents(&s) & CTRL_EV_LIMIT) != 0u) { hits++; }
+        }
+        (void)pre;
+        CK(hits == 0, "LIMIT debounce: clamp flutter 100x -> no repeat report (first episode already reported)");
+    }
+    {
+        /* 消退去抖：夹紧 → 连续 1s 不夹紧 → 再夹紧 = 允许新事件（真正的两次事件） */
+        int hits = 0;
+        Ctrl_Init(&s, &p); s.enabled = 1u; Ctrl_SetMode(&s, CTRL_MODE_TORQUE, 0.0f, 0.0f);
+        Ctrl_SetTorque(&s, 7.5f);
+        for (i = 0; i < 10; i++) { Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f); if ((Ctrl_TakeEvents(&s) & CTRL_EV_LIMIT) != 0u) { hits++; } }
+        Ctrl_SetTorque(&s, 0.0f);
+        for (i = 0; i < 250; i++) { Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f); (void)Ctrl_TakeEvents(&s); } /* 1.25s 不夹紧 */
+        Ctrl_SetTorque(&s, 7.5f);
+        for (i = 0; i < 10; i++) { Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f); if ((Ctrl_TakeEvents(&s) & CTRL_EV_LIMIT) != 0u) { hits++; } }
+        CK(hits == 2, "LIMIT debounce: 1s clear -> re-arms, second episode reports again");
+    /* ★ 摩擦前馈（库仑摩擦补偿）：必须按**设定点方向**取号，否则反向时变成"反向拖拽" */
+    Ctrl_Init(&s, &p);
+    p.tff_nm = 0.15f;
+    s.enabled = 1u;
+    Ctrl_SetMode(&s, CTRL_MODE_SPEED, 0.0f, 0.0f);
+    Ctrl_SetVel(&s, 10.0f);
+    for (i = 0; i < 30; i++) { Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f); }
+    CK(f.t_nm > 0.10f, "TFF: +setpoint -> positive friction feedforward (0.15Nm + P term)");
+    Ctrl_SetVel(&s, -10.0f);
+    for (i = 0; i < 60; i++) { Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f); }
+    CK(f.t_nm < -0.10f, "TFF: -setpoint -> negative friction feedforward (sign follows direction)");
+    p.tff_nm = 0.0f;
+    }
+    }
+    {
+        int hits = 0;
+        Ctrl_Init(&s, &p); s.enabled = 1u; Ctrl_SetMode(&s, CTRL_MODE_SPEED, 0.0f, 0.0f);
+        for (i = 0; i < 20; i++) { (void)Ctrl_Protect(&s, &p, 0.0f, 0.0f, 0.0f, 30.0f, 30.0f, 0x40u, 5u); if ((Ctrl_TakeEvents(&s) & CTRL_EV_MOTERR) != 0u) { hits++; } }
+        CK(hits == 1, "MOTERR latched: 20 cycles of error bits -> exactly 1 event");
+    }
+    CK(Ctrl_ParamsDefault != NULL, "params default api present");
+
+    Ctrl_SetMode(&s, CTRL_MODE_SPEED, 0.0f, 0.0f);
+    Ctrl_SetVel(&s, 60.0f);
+    Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f);
+    CK(f.kp == 0.0f && f.kd == p.kd_damp, "SPEED: kp=0 + damping kd");
+    CK(f.t_nm > 0.0f, "SPEED: PI gives positive torque for positive error");
+    for (i = 0; i < 200; i++) { Ctrl_Step(&s, &p, 0.0f, 0.0f, 5u, &f); }
+    CK(f.t_nm <= p.tmax_nm + 0.001f && f.t_nm >= -p.tmax_nm, "SPEED: torque clamped (anti-windup)");
+
+    Ctrl_Ping(&s, 1000u);
+    CK(Ctrl_Heartbeat(&s, &p, 1100u) == 0u, "heartbeat ok inside wd");
+    CK(Ctrl_Heartbeat(&s, &p, 1300u) == 1u && s.mode == CTRL_MODE_DAMP, "heartbeat timeout -> DAMP");
+    CK(s.enabled == 1u, "timeout does NOT disable (no brake -> stay damped)");
+
+    Ctrl_Init(&s, &p); s.enabled = 1u; Ctrl_SetMode(&s, CTRL_MODE_POS, 0.0f, 0.0f); s.set_applied = 0.0f;
+    e = 0u;
+    for (i = 0; i < 60; i++) { e |= Ctrl_Protect(&s, &p, 100.0f, 0.0f, 0.0f, 30.0f, 30.0f, 0u, 10u); }
+    CK((e & CTRL_EV_FOLLOW) != 0u && s.mode == CTRL_MODE_DAMP, "FOLLOW: 30deg error for 500ms -> DAMP");
+
+    Ctrl_Init(&s, &p); s.enabled = 1u; Ctrl_SetMode(&s, CTRL_MODE_SPEED, 0.0f, 0.0f);
+    e = 0u;
+    for (i = 0; i < 110; i++) { e |= Ctrl_Protect(&s, &p, 0.0f, 2.0f, 9.0f, 30.0f, 30.0f, 0u, 10u); }
+    CK((e & CTRL_EV_STALL) != 0u, "STALL: high torque + low speed for 1s -> event");
+
+    Ctrl_Init(&s, &p); s.enabled = 1u; Ctrl_SetMode(&s, CTRL_MODE_SPEED, 0.0f, 0.0f);
+    e = Ctrl_Protect(&s, &p, 0.0f, 0.0f, 0.0f, 90.0f, 30.0f, 0u, 10u);
+    CK((e & CTRL_EV_TEMP) != 0u && s.mode == CTRL_MODE_DAMP, "TEMP: above stop threshold -> DAMP");
+
+    Ctrl_Init(&s, &p); s.enabled = 1u; Ctrl_SetMode(&s, CTRL_MODE_SPEED, 0.0f, 0.0f);
+    e = Ctrl_Protect(&s, &p, 0.0f, 0.0f, 0.0f, 30.0f, 30.0f, 0x40u, 10u);
+    CK((e & CTRL_EV_MOTERR) != 0u, "MOTOR ERR bit (byte0) -> event");
+
+    Ctrl_Estop(&s);
+    CK(s.enabled == 0u && s.estop == 1u, "ESTOP: disabled + estop latched");
+    CK(strcmp(Ctrl_ModeStr(CTRL_MODE_POS), "POS") == 0 && strcmp(Ctrl_ModeStr(CTRL_MODE_DAMP), "DAMP") == 0 &&
+       strcmp(Ctrl_ModeStr(CTRL_MODE_IDLE), "IDLE") == 0, "mode strings");
+
+    printf("  ==> %s (fail=%d)\n", F ? "FAIL" : "ALL PASS", F);
+    return F ? 1 : 0;
+}
+"""
+
+UIACT_TEST = r"""
+#include "stdio.h"
+#include "string.h"
+#include "ui_action.h"
 static int F;
 #define CK(c, m) do { if (c) printf("  PASS  %s\n", m); else { printf("  FAIL  %s\n", m); F++; } } while (0)
 int main(void)
 {
-    int r, viol = 0;
-
-    CK(J8108_ActionDecide(1, 5000, 1, ACT_ST_READY) == ACT_DO_NOTHING, "read-only row1 -> DO_NOTHING (silent)");
-    CK(J8108_ActionDecide(7, 5000, 1, ACT_ST_INIT_OK) == ACT_DO_NOTHING, "read-only row7 -> DO_NOTHING");
-    CK(J8108_ActionDecide(0, 1999, 1, ACT_ST_INIT_OK) == ACT_REJECT_SHORT, "1999ms < 2.0s -> REJECT_SHORT");
-    CK(J8108_ActionDecide(0, 2000, 1, ACT_ST_INIT_OK) == ACT_ENABLE, "exactly 2.0s -> triggered (enable)");
-    CK(J8108_ActionDecide(0, 2001, 1, ACT_ST_INIT_OK) == ACT_ENABLE, ">2.0s -> triggered");
-    CK(J8108_ActionDecide(0, 3000, 0, ACT_ST_INIT_OK) == ACT_REJECT_COOLDOWN, "cooldown active -> rejected");
-    CK(J8108_ActionDecide(0, 3000, 1, ACT_ST_INIT_FAIL) == ACT_REJECT_CAN, "CAN init fail -> rejected");
-    CK(J8108_ActionDecide(0, 3000, 1, ACT_ST_BUS_ERR) == ACT_REJECT_CAN, "CAN bus err -> rejected");
-    CK(J8108_ActionDecide(0, 3000, 1, ACT_ST_INIT_OK) == ACT_ENABLE, "no feedback yet -> ENABLE");
-    CK(J8108_ActionDecide(0, 3000, 1, ACT_ST_READY) == ACT_DISABLE, "feedback flowing -> DISABLE (toggle)");
-    for (r = ACTR_NONE; r <= ACTR_CAN_NOT_READY; r++)
-    {
-        const char *s = J8108_ActionResultStr((J8108_ActionResult_e)r);
-        if (strlen(s) > 21u) { printf("  FAIL  result string >21 chars: %s\n", s); viol++; }
-    }
-    CK(viol == 0, "all action-result strings fit the 21-char row");
-    CK(strcmp(J8108_ActionResultStr(ACTR_EN_NO_ACK), "EN NO ACK/NODE") == 0, "result string mapping");
-    CK(J8108_ACTION_HOLD_MS == 2000u && J8108_ACTION_COOLDOWN_MS == 1500u && J8108_ACTION_ROW == 0u,
-       "constants: 2s hold / 1.5s cooldown / row0");
+    CK(Ui_ActionDecide(UI_GES_CLICK, 0u, 2000u) == UI_ACT_PAGE_NEXT, "click -> next page");
+    CK(Ui_ActionDecide(UI_GES_DOUBLE, 0u, 2000u) == UI_ACT_PAGE_PREV, "double -> prev page");
+    CK(Ui_ActionDecide(UI_GES_HOLD, 1999u, 2000u) == UI_ACT_NONE, "hold 1999ms -> nothing");
+    CK(Ui_ActionDecide(UI_GES_HOLD, 2000u, 2000u) == UI_ACT_PAGE_HOME, "hold >=2s -> home");
+    CK(Ui_ActionDecide(UI_GES_STUCK, 9000u, 2000u) == UI_ACT_NONE, "stuck -> voided (no action)");
+    CK(Ui_PageNext(0u, 4u) == 1u && Ui_PageNext(3u, 4u) == 0u, "page next wraps");
+    CK(Ui_PagePrev(0u, 4u) == 3u && Ui_PagePrev(2u, 4u) == 1u, "page prev wraps");
+    CK(Ui_PageNext(0u, 1u) == 0u && Ui_PagePrev(0u, 1u) == 0u, "single page stays 0");
+    CK(UI_HOME_HOLD_MS == 2000u, "home hold threshold = 2s");
+    CK(strcmp(Ui_ActionStr(UI_ACT_PAGE_NEXT), "PAGE_NEXT") == 0, "action string mapping");
     printf("  ==> %s (fail=%d)\n", F ? "FAIL" : "ALL PASS", F);
     return F ? 1 : 0;
 }
@@ -230,7 +423,9 @@ def host_tests(tmp):
     cases = [
         ("按键事件机 key_core", "key", ["mcu_bsp/key/key_core.c", "mcu_bsp/key/key_core.h"], KEY_TEST),
         ("电机协议 motor_8108", "motor", ["mcu_bsp/Motor/motor_8108.c", "mcu_bsp/Motor/motor_8108.h"], MOTOR_TEST),
-        ("单键动作策略 j8108_action", "action", ["mcu_bsp/Motor/j8108_action.h"], ACTION_TEST),
+        ("命令行解析 cmd_parse", "cmdparse", ["mcu_bsp/proto/cmd_parse.h"], CMD_TEST),
+        ("控制核 ctrl_core", "ctrl", ["mcu_bsp/ctrl/ctrl_core.c", "mcu_bsp/ctrl/ctrl_core.h"], CTRL_TEST),
+        ("按键 UI 策略 ui_action", "uiact", ["mcu_bsp/Motor/ui_action.h"], UIACT_TEST),
     ]
     for title, tag, srcs, harness in cases:
         d = os.path.join(tmp, tag)
@@ -258,7 +453,31 @@ def static_checks():
     print("---- 静态断言（宏 / 任务接线 / 日志 ASCII / 创建失败可见性）----")
     fc = read(os.path.join(BASE, "Task", "Inc", "feature_config.h"))
     macros = dict(re.findall(r"#define\s+(FEATURE_\w+)\s+(\d+)u", fc))
-    check("feature_config.h: 8 个功能宏齐全", len(macros) == 8, str(sorted(macros)))
+    need = {"FEATURE_J8108", "FEATURE_KEY", "FEATURE_DISP_UI", "FEATURE_MONITOR_TASK",
+            "FEATURE_SERIAL_CTRL", "FEATURE_LED_TASK", "FEATURE_SD_CARD", "FEATURE_SD_CLI",
+            "FEATURE_CAR_TASKS", "FEATURE_VERBOSE_LOG", "FEATURE_DISP_SH1106_I2C",
+            "FEATURE_DISP_ST7735S_SPI"}
+    check("feature_config.h: 12 个功能宏齐全（含显示驱动选择）", need <= set(macros),
+          str(sorted(need - set(macros))))
+    check("feature_config.h: 4 个预设组合 + CFG_PROFILE 可被 -D 覆盖（组合编译矩阵的前提）",
+          all(f"#define {p} " in fc for p in ("PROFILE_FULL", "PROFILE_DISP_DEV",
+                                              "PROFILE_MOTOR_DEV", "PROFILE_MINIMAL"))
+          and "#ifndef CFG_PROFILE" in fc)
+    check("feature_config.h: 依赖矩阵齐全（MONITOR→DISP_UI / MONITOR→KEY / SD_CLI→SD_CARD / 显示驱动唯一）",
+          all(s in fc for s in ("FEATURE_MONITOR_TASK requires FEATURE_DISP_UI",
+                                "FEATURE_MONITOR_TASK requires FEATURE_KEY",
+                                "FEATURE_SD_CLI requires FEATURE_SD_CARD",
+                                "needs exactly ONE display driver",
+                                "two display drivers enabled")))
+    _mc = read(os.path.join(BASE, "Core", "Src", "main.c"))
+    check("安全告警 R7：关闭安全模块的编译期告警在组装根 main.c（且已从共享头移出）",
+          "motor control and protection are OFF" in _mc
+          and "motor control and protection are OFF" not in fc)
+    dv = re.findall(r"#define\s+FEATURE_DISP_SH1106_I2C\s+(\d+)u", fc)
+    ds = re.findall(r"#define\s+FEATURE_DISP_ST7735S_SPI\s+(\d+)u", fc)
+    check("feature_config.h: 显示驱动恰好选中一个（同一组引脚，不能俩都开）",
+          len(dv) == 1 and len(ds) == 1 and ((dv[0] == "1") != (ds[0] == "1")),
+          f"sh1106={dv} st7735s={ds}")
 
     mainc = read(os.path.join(BASE, "Core", "Src", "main.c"))
     live = [ln for ln in mainc.splitlines() if not ln.strip().startswith(("//", "*"))]
@@ -270,6 +489,135 @@ def static_checks():
     check("main.c: J8108_Task_Init() 在非注释代码中", live_has("J8108_Task_Init();"))
     check("main.c: 二者均在 #if FEATURE_* 保护块内", "#if FEATURE_KEY" in mainc and "#if FEATURE_J8108" in mainc)
     check("main.c: SD/CLI/小车 已被宏包住", all(f"#if FEATURE_{x}" in mainc for x in ("SD_CARD", "SD_CLI", "CAR_TASKS")))
+    # ---- M1 抓到的两个"隐藏依赖"回归（协议发送口 / 串口任务被错误嵌套）----
+    check("main.c: Proto_TxInit 在显示宏之前（协议发送口与显示解耦）",
+          mainc.index("Proto_TxInit();") < mainc.index("#if FEATURE_DISP_UI"))
+    _seg = mainc[mainc.index("#if FEATURE_J8108"):mainc.index("#if FEATURE_SERIAL_CTRL")]
+    check("main.c: CmdRx_Task_Init 只由 SERIAL_CTRL 门控（J8108 块已闭合，不再嵌套）",
+          "#endif" in _seg and "CmdRx_Task_Init" not in _seg)
+    # ---- M2：依赖收口（隐藏依赖不许复活；见 docs/日志_模块化改造.md M2）----
+    _cx = read(os.path.join(BASE, "Task", "Src", "CmdRx_Task.c"))
+    _jt = read(os.path.join(BASE, "Task", "Src", "J8108_Task.c"))
+    check("M2: #TEL 在无监控任务时回 @ERR 4（不许假 @OK —— 回包必须与行为一致）",
+          "feature=monitor off (telemetry has no producer)" in _cx
+          and "#if FEATURE_MONITOR_TASK" in _cx)
+    check("M2: 电机模块关闭时 #EN 类命令回 @ERR 4（不许让上位机误判成接线/NOACK）",
+          "feature=j8108 off (this firmware has no motor module)" in _cx
+          and "J8108_RES_DISABLED" in _cx)
+    check("M2: J8108_Task.c 有'显式停用桩'（服务模块被通用层调用 → 允许桩，但必须诚实报停用）",
+          re.search(r"#else\s+/\* !FEATURE_J8108", _jt) is not None
+          and "J8108_RES_DISABLED" in _jt and "#if FEATURE_J8108" in _jt)
+    check("M2: J8108_Task.c 不再依赖 UI 策略头（单向依赖：控制层不依赖 UI 层）",
+          re.search(r'#include\s+"ui_action\.h"', _jt) is None)
+    for _l in [ln for ln in mainc.splitlines() if "@BOOT" in ln and "LOG_I" in ln]:
+        _fmt = re.findall(r'"([^"]*)"', _l)[0]
+        check(f"横幅单行 ≤110 字符（LOG_FMT_BUF_SIZE=128 会截断，M1 实测）: {_fmt[:34]}…",
+              len(_fmt) <= 110, f"{len(_fmt)} chars")
+    # ---- M3：文件级隔离（R3）——每个"模块实现文件"都必须被自己的宏包住 ----
+    M3_WRAP = {
+        "Task/Src/Oled_Task.c": "FEATURE_DISP_UI",
+        "Task/Src/Monitor_Task.c": "FEATURE_MONITOR_TASK",
+        "Task/Src/CmdRx_Task.c": "FEATURE_SERIAL_CTRL",
+        "Task/Src/Led_Task.c": "FEATURE_LED_TASK",
+        "Task/Src/SdCard_Task.c": "FEATURE_SD_CARD",
+        "Task/Src/J8108_Task.c": "FEATURE_J8108",
+        "mcu_bsp/key/bsp_key.c": "FEATURE_KEY",
+        "mcu_bsp/oled/OLED.c": "FEATURE_DISP_SH1106_I2C",
+        "mcu_bsp/oled/OLED_Data.c": "FEATURE_DISP_SH1106_I2C",
+        "mcu_bsp/sd/sd_sdio.c": "FEATURE_SD_CARD",
+        "mcu_bsp/fs/sd_fs.c": "FEATURE_SD_CARD",
+        "mcu_bsp/fs/sd_diskio.c": "FEATURE_SD_CARD",
+        "mcu_bsp/cli/sd_cli.c": "FEATURE_SD_CLI",
+        "Middlewares/Third_Party/FatFs/src/ff.c": "FEATURE_SD_CARD",
+        "Middlewares/Third_Party/FatFs/src/option/ccsbcs.c": "FEATURE_SD_CARD",
+    }
+    _bad_wrap = []
+    for _rel, _mac in M3_WRAP.items():
+        _txt = read(os.path.join(BASE, _rel.replace("/", os.sep)))
+        _head = "\n".join(_txt.splitlines()[:60])
+        if (re.search(rf"#\s*if.*\b{_mac}\b", _head) is None) or (f"#endif /* {_mac} */" not in _txt):
+            _bad_wrap.append(_rel)
+    check(f"M3: {len(M3_WRAP)} 个模块实现文件均被自己的宏包住（首 60 行内 #if、末尾 #endif）",
+          not _bad_wrap, ",".join(_bad_wrap))
+    _fc_cfg = read(os.path.join(BASE, "Task", "Inc", "feature_config.h"))
+    check("M3: 编译期告警只在组装根 main.c 报一次（共享头里放 #warning 会变成 N 条同文噪声）",
+          "#warning" not in _fc_cfg and "#warning" in mainc and "!FEATURE_J8108" in mainc)
+    # ---- M4：模块自检 #ST ----
+    _cp4 = read(os.path.join(BASE, "mcu_bsp", "proto", "cmd_parse.h"))
+    _man4 = read(os.path.join(BASE, "docs", "操作手册_串口命令.md"))
+    _cmd4 = read(os.path.join(BASE, "Task", "Src", "CmdRx_Task.c"))
+    check("M4: #ST 进了解析表且手册有对应行", '"ST"' in _cp4 and "#ST" in _man4)
+    M4_ST = {
+        "Task/Src/Oled_Task.c": "Oled_SelfTest",
+        "Task/Src/Led_Task.c": "Led_SelfTest",
+        "mcu_bsp/key/bsp_key.c": "Key_SelfTest",
+        "Task/Src/Monitor_Task.c": "Monitor_SelfTest",
+        "Task/Src/J8108_Task.c": "J8108_SelfTest",
+    }
+    _miss = [f for f, fn in M4_ST.items() if fn not in read(os.path.join(BASE, f.replace("/", os.sep)))]
+    check(f"M4: {len(M4_ST)} 个模块都实现了 Xxx_SelfTest()（非破坏性只读）", not _miss, ",".join(_miss))
+    check("M4: 自检码语义 0/1/2/3 + 未编译走 @ERR 9 code=255（实现与手册一致）",
+          ("code=255" in _cmd4) and ("self-test FAIL" in _cmd4)
+          and ("`0`=本固件未编译" in _man4) and ("`1`=OK" in _man4))
+    _nst = len(re.findall(r'\{\s*"(?:disp|led|key|can|j8108|monitor)",\s*st_', _cmd4))
+    check("M4: #ST 汇总恰好 6 个模块占位（≤6/行，防 127B 截断老坑）", _nst == 6, f"{_nst} 个")
+    # 台架实测抓到过：`#ST` 汇总回包写成 `@OK disp=1 ...`（漏了命令名，与手册 `@OK ST disp=1 ...` 不一致）。
+    # 这类"回包与协议口径不一致"必须机械防住：所有 reply_ok 的首字段要么是大写命令名，要么是变量里的命令名。
+    _bad_tag = []
+    for _m in re.finditer(r'reply_ok\(\s*"([^"]*)"', _cmd4):
+        _fmt = _m.group(1)
+        _first = _fmt.split(" ")[0] if _fmt else ""
+        if not (re.fullmatch(r"[A-Z][A-Z0-9_]*", _first) or _first == "%s"):
+            _bad_tag.append(_fmt[:44])
+    check("M4: 所有 @OK 回包首字段都是命令名（防'漏命令名'的协议口径不一致）",
+          not _bad_tag, "; ".join(_bad_tag))
+    # ---- M5：板级常量抽离（K5）——模块里不许再出现裸引脚值 ----
+    _bc = os.path.join(BASE, "Task", "Inc", "board_config.h")
+    _bc_txt = read(_bc)
+    check("M5: board_config.h 存在且含 LED/按键/屏幕口三组常量 + 口位注释",
+          all(k in _bc_txt for k in ("BRD_LED_GRN_PIN", "BRD_KEY_PIN", "BRD_SCR_CS_PIN",
+                                     "BRD_SCR_I2C_SDA_PIN", "BRD_LED_EXT_FIRST_PIN",
+                                     "pin1", "pin7", "换板子/换屏只改本文件")))
+    # 允许例外（已登记在 board_config.h 头部）：不在编译集内的 dc_motor.c、SD 关闭态的 sd_sdio.h
+    _M5_OK = {"mcu_bsp\\Motor\\dc_motor.c", "mcu_bsp\\sd\\sd_sdio.h",
+              "Task\\Inc\\board_config.h"}
+    _pin_re = re.compile(r"GPIO[A-K]\b|GPIO_PIN_\d+")
+    _bare = []
+    for _root in ("Task", "mcu_bsp"):
+        for _dp, _, _fns in os.walk(os.path.join(BASE, _root)):
+            for _fn in _fns:
+                if not _fn.endswith((".c", ".h")):
+                    continue
+                _p = os.path.join(_dp, _fn)
+                _rel = os.path.relpath(_p, BASE)
+                if _rel in _M5_OK:
+                    continue
+                _txt = open(_p, encoding="utf-8", errors="replace").read()
+                _txt = re.sub(r"/\*.*?\*/", "", _txt, flags=re.S)   # 去块注释
+                _txt = re.sub(r"//[^\n]*", "", _txt)                # 去行注释
+                if _pin_re.search(_txt):
+                    _bare.append(_rel)
+    check("M5: Task/ 与 mcu_bsp/ 下的裸引脚值为 0（只允许在 board_config.h，例外已登记）",
+          not _bare, ",".join(_bare))
+    # ---- V9：FEATURE_* 不许是"僵尸宏"（声明了没人用）----
+    _feat = re.findall(r"#define\s+(FEATURE_[A-Z0-9_]+)\s", _fc_cfg)
+    _blob = []
+    for _root in ("Task", "mcu_bsp", "Core"):
+        for _dp, _, _fns in os.walk(os.path.join(BASE, _root)):
+            for _fn in _fns:
+                if _fn.endswith((".c", ".h")):
+                    _blob.append(open(os.path.join(_dp, _fn), encoding="utf-8",
+                                      errors="replace").read())
+    _blob = "\n".join(_blob)
+    # 已登记豁免：驱动尚未实现（S1 落地后它自然会被多处引用）
+    _V9_OK = {"FEATURE_DISP_ST7735S_SPI"}
+    _zombie = []
+    for _f in _feat:
+        _n = len(re.findall(r"\b" + _f + r"\b", _blob))
+        if (_f not in _V9_OK) and (_n < 3):
+            _zombie.append(f"{_f}({_n})")
+    check(f"V9: {len(_feat)} 个 FEATURE_* 都至少被 2 处使用（防僵尸宏，豁免已登记）",
+          not _zombie, ",".join(_zombie))
 
     bad = []
     for rel in ("mcu_bsp/key/bsp_key.c", "Task/Src/J8108_Task.c", "Task/Src/Oled_Task.c", "mcu_bsp/Motor/motor_8108.c"):
@@ -280,12 +628,12 @@ def static_checks():
                         bad.append(f"{rel}:{i}")
     check("日志字符串全 ASCII（英文约定，防乱码）", not bad, "; ".join(bad[:3]))
 
-    for rel in ("mcu_bsp/key/bsp_key.c", "Task/Src/J8108_Task.c", "Task/Src/Oled_Task.c"):
+    for rel in ("mcu_bsp/key/bsp_key.c", "Task/Src/J8108_Task.c", "Task/Src/Monitor_Task.c", "Task/Src/CmdRx_Task.c"):
         t = read(os.path.join(BASE, rel.replace("/", os.sep)))
         n = t.count("xTaskCreate(")
         check(f"{os.path.basename(rel)}: xTaskCreate 均有 pdPASS 检查", n > 0 and t.count("pdPASS") >= n)
 
-    # ---- 需求回归（用户 2026-09-15 明确要求，防止以后被改回去）----
+    # ---- 需求回归（用户明确要求，防被改回去）----
     oled = read(os.path.join(BASE, "Task", "Src", "Oled_Task.c"))
     check("需求: 行0 覆盖 CAN 四态上屏（INIT FAIL/INIT OK/READY/BUS ERR）",
           all(f"J8108_ST_{s}" in oled for s in ("INIT_FAIL", "INIT_OK", "READY", "BUS_ERR")))
@@ -293,29 +641,126 @@ def static_checks():
     bkey = read(os.path.join(BASE, "mcu_bsp", "key", "bsp_key.h"))
     check("需求: PB2 高有效（KEY_ACTIVE_LEVEL=1u，A 板实测）",
           re.search(r"#define\s+KEY_ACTIVE_LEVEL\s+\(1u\)", bkey) is not None)
+    check("需求: 日志只打事件 + 绝不重播旧数值（LINK DOWN 时不打数值）",
+          "stale values not printed on purpose" in read(os.path.join(BASE, "Task", "Src", "Monitor_Task.c")))
 
-    # ---- M3 动作层接线（长按→发帧 + 保护层必须都在）----
-    jt = read(os.path.join(BASE, "Task", "Src", "J8108_Task.c"))
-    check("M3: 消费 HOLD_RELEASE 长按事件", "KEY_BIT_HOLD_RELEASE" in jt)
-    check("M3: 走纯策略层 J8108_ActionDecide()", "J8108_ActionDecide(" in jt)
-    check("M3: 真正发帧（J8108_SendCmd）", "J8108_SendCmd(" in jt)
-    check("M3: L3.5 无 ACK 主动丢帧（防无限重传→总线错误）", "HAL_CAN_AbortTxRequest" in jt)
-    check("M3: L4 反馈确认（使能→出现 / 失能→停止）", "ACTR_EN_OK" in jt and "ACTR_DIS_OK" in jt)
-    check("M3: UI 发布光标行", "Oled_UiGetCursorRow" in oled and "s_cursor_row" in oled)
-    check("M3: 行7 显示动作结果", "J8108_ActionResultStr" in oled)
-    check("M2: 帧一致取帧（临界区 + new_frame）", "taskENTER_CRITICAL" in read(os.path.join(BASE, "mcu_bsp", "Motor", "motor_8108.c")))
+    # ---- 协议 v1 架构（2026-09-17 定稿）----
+    cmd = read(os.path.join(BASE, "Task", "Src", "CmdRx_Task.c"))
+    ctrl = read(os.path.join(BASE, "mcu_bsp", "ctrl", "ctrl_core.c"))
+    mon = read(os.path.join(BASE, "Task", "Src", "Monitor_Task.c"))
+    uia = read(os.path.join(BASE, "mcu_bsp", "Motor", "ui_action.h"))
+    cp = read(os.path.join(BASE, "mcu_bsp", "proto", "cmd_parse.h"))
+    tx = read(os.path.join(BASE, "mcu_bsp", "proto", "proto_tx.c"))
+    mh = read(os.path.join(BASE, "mcu_bsp", "Motor", "motor_8108.h"))
+    mc = read(os.path.join(BASE, "mcu_bsp", "Motor", "motor_8108.c"))
 
-    # ---- M4-a：HOLD 阻尼保持（= 让电机回传反馈的"心跳"通道）----
-    check("M4-a: HOLD 模式开关与进入/退出", all(k in jt for k in ("J8108_HOLD_ON_ENABLE", "hold_enter", "hold_exit")))
-    check("M4-a: HOLD 轮询（周期发 MIT + 看门狗）", "j8108_hold_poll" in jt and "J8108_HOLD_WD_MS" in jt)
-    check("M4-a: 看门狗无 ACK/反馈丢失即停发（防无限重传）", "HOLD watchdog" in jt)
-    check("M4-a: 屏上区分 HOLD/SEND", "J8108_IsHoldMode" in oled)
-    check("M4-a: TX 无 ACK 判定带迟滞（j8108_tx_stuck：连续占用才判死）", "j8108_tx_stuck" in jt)
-    check("M4-a: L3.5 单次检查（s_ack_checked）防反复重进 HOLD", "s_ack_checked" in jt)
-    check("M4-a: 自动恢复（hold_want + 退避 retry + 失败上限）",
-          all(k in jt for k in ("s_hold_want", "s_hold_retry_ms", "J8108_HOLD_RETRY_MAX")))
-    check("M4-a: 反馈流日志只在数据新鲜时打印", "J8108_FB_TIMEOUT_MS) &&" in jt)
-    check("需求: 10s 摘要链路断时不打印陈旧数值（只报 link DOWN）", "stale values not printed on purpose" in jt)
+    check("协议: 命令表齐全（19 类关键命令）",
+          all(f"CMD_{k}" in cp for k in ("PING", "VER", "STAT", "EN", "DIS", "STOP", "ESTOP", "MODE", "DAMP",
+                                         "V", "P", "T", "IMP", "HOLD", "SETP", "LIM", "RATE", "WD", "TEL")))
+    check("协议: 三类行前缀齐全（@OK/@ERR/@EVT/@TEL）",
+          all(p in (cmd + mon + read(os.path.join(BASE, "Task", "Src", "J8108_Task.c"))) for p in
+              ("@OK ", "@ERR ", "@EVT ", "@TEL ")))
+    check("协议: CmdRx **不直接碰 CAN**（发帧一律交 J8108 任务）",
+          not any(k in cmd for k in ("HAL_CAN_", "J8108_SendCmd", "J8108_SendMIT")))
+    check("协议: 使能类走异步握手（ReqStart/ReqResult/ReqClear）",
+          all(k in cmd for k in ("J8108_ReqStart", "J8108_ReqResult", "J8108_ReqClear")))
+    check("协议: ISR 侧只搬字节（无 snprintf/LOG 于中断回调）",
+          "void CmdRx_RxIsr(void)" in cmd and "snprintf" not in cmd.split("void CmdRx_RxIsr(void)")[1].split("static uint8_t ring_pop")[0])
+    check("协议: 上行串行化（proto_tx 互斥 + 整行 blocking 发送）",
+          "xSemaphoreCreateMutex" in tx and "USART_TRANSFER_BLOCKING" in tx)
+
+    check("安全: 心跳超时→阻尼（不失能，防坠）", "Ctrl_Heartbeat" in read(os.path.join(BASE, "Task", "Src", "J8108_Task.c")) and "CTRL_EV_TIMEOUT" in ctrl)
+    check("安全: 无 ACK 主动丢帧（防无限重传→总线错误）", "HAL_CAN_AbortTxRequest" in read(os.path.join(BASE, "Task", "Src", "J8108_Task.c")))
+    check("安全: 位置模式 Kp/Kd 成对下发（文档警告 Kp≠0&Kd=0 失控）",
+          "out->kp = p->kp_pos" in ctrl and "out->kd = p->kd_pos" in ctrl)
+    check("安全: 设定点速率限制 + 限幅（slew/clampf）", "slew(" in ctrl and "clampf(" in ctrl)
+    check("安全: 保护项齐全（跟随/堵转/过温/电机报错位）",
+          all(k in ctrl for k in ("CTRL_EV_FOLLOW", "CTRL_EV_STALL", "CTRL_EV_TEMP", "CTRL_EV_MOTERR")))
+    check("安全: #SETP 默认锁死（需解锁）", "setp_unlocked" in ctrl and "locked: use" in cmd)
+
+    check("按键: 策略层纯 UI（ui_action.h 无 CAN/发帧符号）",
+          not any(k in uia for k in ("SendMIT", "SendCmd", "HAL_CAN")))
+    check("按键: 控制任务不再消费按键事件（按键绝不发帧）",
+          "KEY_BIT_HOLD_RELEASE" not in read(os.path.join(BASE, "Task", "Src", "J8108_Task.c")))
+
+    check("屏幕: 4 页定义齐全", all(k in oled for k in ("UI_PAGE_LINK", "UI_PAGE_MOTION", "UI_PAGE_SERIAL")) and "SYSTEM" in oled)
+    check("屏幕: 局部刷新（逐行比较，无变化不刷）", "s_last[row]" in oled and "memcmp(" in oled)
+    check("Monitor: 三层同源快照（屏/日志/遥测都读 CopySnapshot）",
+          "J8108_CopySnapshot" in mon and mon.count("Monitor_FormatTel(b") >= 1)
+    check("Monitor: 优先级 3（低于控制 5）且周期 100ms/1000ms",
+          "MON_TASK_PRIORITY (3U)" in mon and "MON_UI_MS (100U)" in mon and "MON_LOG_MS (1000U)" in mon)
+    check("Monitor: 数值只在数据新鲜时输出", "MON_FRESH_MS" in mon and "fresh != 0u" in mon)
+    check("控制: 控制任务优先级 5（保时）+ 200Hz 帧周期", "J8108_TASK_PRIORITY (5U)" in read(os.path.join(BASE, "Task", "Src", "J8108_Task.c")) and "J8108_CTRL_PERIOD_MS (5U)" in read(os.path.join(BASE, "Task", "Src", "J8108_Task.c")))
+
+    check("口径: 双编（输出端、±12.56 rad、不除 8）",
+          "J8108_SCALE_OUTPUT_SIDE (1u)" in mh and "J8108_P_HI (12.56f)" in mh)
+    check("口径: 反馈 byte0 = ERR 报错位已解算", "s_dev.fb.err = d[0]" in mc)
+    # ---- 驱动初始化接线（2026-09-18 实机教训：J8108_Task_Init 漏调 J8108_Init → 状态恒 INIT_FAIL）----
+    jt3 = read(os.path.join(BASE, "Task", "Src", "J8108_Task.c"))
+    check("接线: J8108_Task_Init 必须调用 J8108_Init(&hcan1)（否则 CAN 从未注册→恒 INIT_FAIL）",
+          "J8108_Init(&hcan1);" in jt3)
+    check("接线: J8108_Task_Init 先注册 CAN 再建任务",
+          jt3.index("J8108_Init(&hcan1);") < jt3.index("xTaskCreate(j8108_task"))
+    check("接线: 每个任务模块的 Init 都要真正建任务（pdPASS 可见）",
+          "xTaskCreate(" in jt3 and "pdPASS" in jt3)
+    # ---- 串口诊断/容错（2026-09-18 实机教训：只发 CR 或不发换行时"看起来没反应"）----
+    cx2 = read(os.path.join(BASE, "Task", "Src", "CmdRx_Task.c"))
+    check("串口: 行结束符容错（\r 或 \n 都作行结束）", "(ch == '\\n') || (ch == '\\r')" in cx2)
+    check("串口: 有原始字节计数 + 前 3 行原样打印（联调诊断）",
+          "s_rx_bytes" in cx2 and "CmdRx_RxBytes" in cx2 and "rx line %u" in cx2)
+    # ---- 操作手册 ↔ 实现一致性（防文档漂移：改了命令/回包就必须同步改手册）----
+    man = read(os.path.join(BASE, "docs", "操作手册_串口命令.md"))
+    CMDNAMES = ["PING", "VER", "STAT", "LOG", "CLR", "SET", "GET", "EN", "DIS", "STOP", "ESTOP", "ZERO", "MODE",
+                "DAMP", "V", "P", "T", "IMP", "HOLD", "SETP", "LIM", "RATE", "WD", "TEL", "HELP"]
+    per_parse = [n for n in CMDNAMES if f'"{n}"' not in cp]
+    missing_doc = [n for n in CMDNAMES if f"#{n}" not in man]
+    check("安全: #STAT 无新鲜数据时不打解码数值（rx=0 全 0 缓冲会解成量程最小值）",
+          "values withheld: no fresh frame" in cmd and "link=DOWN mode=" in cmd and "link=UP mode=" in cmd)
+    check("安全: 屏 P0 从未收到反馈时显示 AGE never（不是 AGE 0ms）",
+          "AGE never  LINK DOWN" in read(os.path.join(BASE, "Task", "Src", "Oled_Task.c")))
+    # ---- 崩溃取证与栈裕量（2026-09-18 实机"发完命令板子没动静"后新增）----
+    check("诊断: 崩溃黑匣子（RTC 备份寄存器，复位不清 → 开机自报）",
+          all(k in read(os.path.join(BASE, "mcu_bsp", "sys_status", "fault_log.c"))
+              for k in ("RTC->BKP0R", "FAULTLOG_MAGIC", "HAL_PWR_EnableBkUpAccess"))
+          and ("FaultLog_Store(" in read(os.path.join(BASE, "Core", "Src", "stm32f4xx_it.c")))
+          and ("FaultLog_StoreStackOverflow" in read(os.path.join(BASE, "Core", "Src", "freertos.c")))
+          and ("FaultLog_InitAndReport" in mainc))
+    check("诊断: 上次死因开机自报（HardFault PC/LR/CFSR + 栈溢出任务名，免调试器）",
+          all(k in mainc for k in ("report_previous_fault", "s_hf_pc", "s_overflow_task")))
+    check("诊断: 三个任务自报栈余量（uxTaskGetStackHighWaterMark + stack_probe.h）",
+          ("stack_probe_tick" in jt3) and ("stack_probe_tick" in mon) and ("stack_probe_tick" in cmd)
+          and ("INCLUDE_uxTaskGetStackHighWaterMark 1" in read(os.path.join(BASE, "Core", "Inc", "FreeRTOSConfig.h"))))
+    # 检查"调用形态"而不是关键词（注释里出现 portMAX_DELAY 是说明文字，不算违规）
+    check("健壮: Proto_Send 有界等待（不得用 portMAX_DELAY 把协议口永久锁死）",
+          ("xSemaphoreTake(s_tx_mtx, pdMS_TO_TICKS(PROTO_TX_WAIT_MS))" in tx)
+          and ("xSemaphoreTake(s_tx_mtx, portMAX_DELAY)" not in tx))
+    check("健壮: CAN 发送自旋 guard 要短（prio5 任务长自旋会饿死串口/屏幕/LED）",
+          ("++guard > 500u" in mc) and ("tx_dropped" in mc))
+    check("诊断: 控制循环抖动可见（dtmax 记录 + 10s 摘要打印）",
+          ("J8108_LoopJitterTake" in jt3) and ("dtmax=" in mon))
+    check("健壮: CmdRx 栈 ≥640 words（snprintf 浮点 + 快照 + b[256] 的实机教训）",
+          "CMD_TASK_STACK_WORDS (640U)" in cmd)
+    check("诊断: LIMIT 事件带三种来源（setpoint/torque/trate）",
+          ('"trate"' in ctrl) and ("CTRL_LIM_TRATE" in read(os.path.join(BASE, "mcu_bsp", "ctrl", "ctrl_core.h"))))
+    check("操作手册: 25 个命令与解析表一致且手册全覆盖", (not per_parse) and (not missing_doc),
+          f"解析表缺 {per_parse} / 手册缺 {missing_doc}")
+    lits_cx = ["mode=DAMP frames=ON", "still enabled", "shaft FREE", "not enabled (send #EN first)",
+               "exceeds #LIM T (torque clamp)", "outside soft limits (see #LIM)", "persistent! resend as",
+               "usage: #V <deg/s> [kd] [tff]", "TEL period=0 (off)"]
+    drift = [l for l in lits_cx if (l not in cmd) or (l not in man)]
+    check("操作手册: 关键回包文本与实现逐字一致（防手册过时）", not drift, str(drift))
+    keys = ["KD_DAMP", "KP_POS", "KD_POS", "KP_V", "KI_V", "KP_IMP", "KD_IMP", "INPOS", "FOLLOW",
+            "RATE", "TRATE", "TFF", "WD", "VMAX", "TMAX", "AUTODAMP", "SETP"]
+    k_drift = [k for k in keys if (k not in cmd) or (k not in man)]
+    check("操作手册: #SET 键表 17 项与实现一致", not k_drift, str(k_drift))
+    check("屏: P2 显示 RX 行数/字节数（区分没字节 vs 没换行）",
+          "%luL %luB" in read(os.path.join(BASE, "Task", "Src", "Oled_Task.c")))
+    jt2 = read(os.path.join(BASE, "Task", "Src", "J8108_Task.c"))
+    check("安全: 运动模式切换前预置 set_applied（防从旧设定点猛冲）",
+          all(k in jt2 for k in ("Ctrl_SetMode(&s_ctrl, CTRL_MODE_POS", "Ctrl_SetMode(&s_ctrl, CTRL_MODE_SPEED",
+                                 "Ctrl_SetMode(&s_ctrl, CTRL_MODE_TORQUE", "Ctrl_SetMode(&s_ctrl, CTRL_MODE_IMP")))
+    check("安全: #ZERO 需二次确认（CONFIRM）", "resend as `#ZERO CONFIRM`" in cmd)
+    check("口径: TX 无 ACK 迟滞判据（连续占用，非瞬时）", "J8108_TxStuck" in mc and "s_tx_busy" in mc)
 
 
 # ============================================================ 构建 + 链接证据
@@ -328,9 +773,19 @@ def build_and_link():
     log = read(os.path.join(MDK, "rebuild_verify.log"))
     check("UV4 退出码 0", r.returncode == 0, str(r.returncode))
     check("0 Error(s), 0 Warning(s)", "0 Error(s), 0 Warning(s)" in log)
-    need = ["main.c", "motor_8108.c", "bsp_key.c", "key_core.c", "Oled_Task.c", "J8108_Task.c"]
-    missing = [f for f in need if f"compiling {f}" not in log]
-    check("6 个关键文件全部编译", not missing, str(missing))
+    need = ["main.c", "motor_8108.c", "bsp_key.c", "key_core.c", "Oled_Task.c", "J8108_Task.c",
+            "ctrl_core.c", "proto_tx.c", "CmdRx_Task.c", "Monitor_Task.c"]
+    # 构建日志只在"真的重编"时出现 "compiling X"；增量构建（无源码变化）不会 → 不能据此判失败。
+    # 更硬的证据是 **MAP 里的对象文件**（只要参与链接就一定有），故以 MAP 为准。
+    _m = read(os.path.join(MDK, PROJ, f"{PROJ}.map"))
+    # Keil 的对象文件名为**全小写**（J8108_Task.c -> j8108_task.o）
+    missing_obj = [o for o in (f.replace(".c", ".o").lower() for f in need) if o not in _m]
+    check("10 个关键文件全部参与链接（MAP 对象证据）", not missing_obj, str(missing_obj))
+    compiled = [f for f in need if f"compiling {f}" in log]
+    if compiled:
+        print(f"        本次构建实际重编 {len(compiled)} 个关键文件；其余为增量复用（对象已在 MAP 内）")
+    else:
+        print("        本次为增量构建（无文件需重编）；对象存在性由 MAP 断言保证")
     for l in log.splitlines():
         if "Program Size" in l:
             print("        " + l.strip())
@@ -340,7 +795,8 @@ def build_and_link():
     m = read(os.path.join(MDK, PROJ, f"{PROJ}.map"))
     check("MAP: main.o -> Key_Task_Init", "main.o(.text.main) refers to bsp_key.o(.text.Key_Task_Init)" in m)
     check("MAP: main.o -> J8108_Task_Init", "main.o(.text.main) refers to j8108_task.o(.text.J8108_Task_Init)" in m)
-    check("MAP: main.o -> Oled_Task_Init", "refers to oled_task.o(.text.Oled_Task_Init)" in m)
+    check("MAP: main.o -> Monitor_Task_Init", "refers to monitor_task.o(.text.Monitor_Task_Init)" in m)
+    check("MAP: main.o -> CmdRx_Task_Init", "refers to cmdrx_task.o(.text.CmdRx_Task_Init)" in m)
 
 
 def main():

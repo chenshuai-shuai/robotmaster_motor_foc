@@ -10,6 +10,12 @@
 #include "bsp_log.h"
 #include "FreeRTOS.h"
 #include "task.h"
+#include "feature_config.h"   /* M3：文件级隔离需要一个统一的开关 */
+
+
+#if FEATURE_SD_CARD
+/* M3 文件级隔离（docs/规范_功能宏与模块化.md R3）：未启用时本文件编译为空对象。
+ * 被谁调用必须由调用点用同一个宏保护（忘保护=链接失败，这是刻意设计的 fail-fast）。 */
 
 SD_HandleTypeDef hsd;
 
@@ -249,3 +255,10 @@ void SD_SDIO_DumpCardInfo(void)
           (int)((csd_lo >> 13) & 1U), (int)((csd_lo >> 12) & 1U),
           (unsigned long)SDIO->POWER);
 }
+
+#else  /* !FEATURE_SD_CARD —— 保留一个中性符号（不是纯空对象，原因如下） */
+/* Drivers/STM32F4xx_HAL_Driver/Src/stm32f4xx_hal_sd.c 里有一处"写路径诊断步进标记"引用本符号。
+ * HAL 文件不该为项目宏加壳，所以 SD 关闭时保留一个中性定义：0 = SD 从未走过任何一步。 */
+volatile uint32_t g_sd_step = 0U;
+
+#endif /* FEATURE_SD_CARD */

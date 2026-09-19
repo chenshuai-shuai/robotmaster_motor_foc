@@ -13,7 +13,7 @@
 #ifndef __VERSION_H
 #define __VERSION_H
 
-#define FW_VERSION_STR    "v0.1.51-dev"   /* 测试开发版（bump_version.py 自动递增） */
+#define FW_VERSION_STR    "v0.1.66-dev"   /* 测试开发版（bump_version.py 自动递增） */
 #define FW_RELEASE_STR    "V0.02.1"       /* 发布版（仅测试通过提交时手动更新）：CLI 终端交互补丁 */
 #define FW_BUILD_DATE     __DATE__        /* 编译器内置：编译日期 */
 #define FW_BUILD_TIME     __TIME__        /* 编译器内置：编译时间 */

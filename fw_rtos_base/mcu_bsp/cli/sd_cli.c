@@ -32,6 +32,12 @@
 
 #include <string.h>
 #include <stdlib.h>
+#include "feature_config.h"   /* M3：文件级隔离需要一个统一的开关 */
+
+
+#if FEATURE_SD_CLI
+/* M3 文件级隔离（docs/规范_功能宏与模块化.md R3）：未启用时本文件编译为空对象。
+ * 被谁调用必须由调用点用同一个宏保护（忘保护=链接失败，这是刻意设计的 fail-fast）。 */
 
 /* ---- 参数（集中配置） ---- */
 #define CLI_LINE_MAX      96U     /* 单条命令行最大长度 */
@@ -439,3 +445,5 @@ void SD_CLI_Init(void)
     uart10.module_callback = cli_rx_callback;
     LOG_I("cli", "SD CLI ready (type 'help' for commands)");
 }
+
+#endif /* FEATURE_SD_CLI */

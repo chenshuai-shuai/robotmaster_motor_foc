@@ -1,272 +1,262 @@
 /*
- * Oled_Task.c - 单页监护界面（M1 骨架版：只读显示 + 上下选中光标 + 长按进度条）
+ * Oled_Task.c - OLED 4 页监护界面渲染器（软 I2C PB10=SCL / PB9=SDA，SH1106，6x8 字体 → 8 行 x 21 字符）
  *
- * 界面：6×8 字体 → 8 行 × 21 字符（OLED 128×64，软 I2C PB10=SCL/PB9=SDA）
- *   行0  CAN 状态 + 反馈帧率 + 使能状态   ← 唯一绑定动作的行（M3 接使能/失能）
- *   行1  位置（电机端 rad / 输出端 度）
- *   行2  速度（rad/s 输出端 / RPM）
- *   行3  前馈扭矩 N·m
- *   行4  MOS 温度 / 线圈温度
- *   行5  反馈帧计数 RX / 发送帧计数 TX
- *   行6  诊断：ΔT（距上一帧）+ CAN 错误状态；按住按键时改为长按进度条
- *   行7  按键提示（2s）> 系统异常 > SD 异常 > 版本 + 运行秒
+ * 页面（docs/协议_串口控制_v1.md §13）：
+ *   P0 LINK   : CAN 四态 + rx/tx + 回传 Hz + ERR 报错位 + 总线诊断
+ *   P1 MOTION : 模式/使能 + pos/vel/T + 设定点 + 本帧 Kp/Kd + 双温度 + 到位
+ *   P2 SERIAL : 协议态（最近命令 / 行计数 / 心跳剩余 / 电机报错 / 协议错误 / 遥测周期）
+ *   P3 SYSTEM : 版本 / 运行时间 / free heap / 任务数 / 保护事件 / 位置量程
  *
- * 交互（M1）：
- *   单击 = 光标下移（回绕）· 双击 = 光标上移 · 长按 = 进度条（M1 不接动作，M3 接）
- *   注意：6×8 字体是 ASCII 字体 → 屏上只用 ASCII（中文需 16×16 汉字单元，本页不用）
- *
- * 并发：显示任务优先级 3（低于控制 5 / 按键 4）—— 软 I2C 刷屏不能挤控制任务；
- *       数据只从 J8108 模块"只读"，本任务不发任何 CAN 帧。
+ * 设计：
+ *   · **局部刷新**：每行与上次比较，只有变化才重画并触发 OLED_Update()（整屏软 I2C ≈10ms，
+ *     局部 1~2 行 ≈1.3~2.6ms；10Hz 下约 2.6% CPU）
+ *   · 本文件**不发任何 CAN 帧**、不碰控制状态（只读快照/只读状态视图）
+ *   · 只用 ASCII（6x8 字体无中文）
  */
 #include "Oled_Task.h"
 
-#include "FreeRTOS.h"
-#include "task.h"
-#include "event_groups.h"
-#include "stdio.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdarg.h>
 
 #include "OLED.h"
+#include "main.h"      /* hcan1 / CAN_ESR_* 宏 */
 #include "bsp_log.h"
-#include "bsp_key.h"
-#include "motor_8108.h"
+#include "ctrl_core.h"
 #include "version.h"
-#include "sys_status.h"
-#include "feature_config.h"
-#include "j8108_action.h" /* ACTR_* 动作结果（行7 显示） */
-#include "J8108_Task.h"   /* J8108_LastAction() */
+#include "feature_config.h"   /* M3：文件级隔离需要一个统一的开关 */
 
-/* ------------------------------ 任务参数 ------------------------------ */
-#define OLED_TASK_PRIORITY (3U)
-#define OLED_TASK_STACK_WORDS (640U) /* 含 snprintf(浮点) → 留裕量 */
-#define OLED_REFRESH_PERIOD_MS (200U)
 
-/* ------------------------------ 界面参数 ------------------------------ */
-#define UI_ROW_H (8U)
-#define UI_ROWS (8U)
-#define UI_ACTION_ROW (0U)      /* 唯一绑定动作的行（M3：使能/失能） */
-#define UI_HOLD_EXEC_MS (2000U) /* 该行的最短按住时长（M3 用；计时不上屏） */
-#define UI_HINT_SHOW_MS (2000U)
+#if FEATURE_DISP_UI
+/* M3 文件级隔离（docs/规范_功能宏与模块化.md R3）：未启用时本文件编译为空对象。
+ * 被谁调用必须由调用点用同一个宏保护（忘保护=链接失败，这是刻意设计的 fail-fast）。 */
 
-extern volatile int g_rw_result; /* SD 读写自检结果（sd_diskio.c） */
+#define UI_COLS (21u)
+#define UI_ROWS (8u)
 
-static TaskHandle_t s_oled_task;
-static volatile uint8_t s_cursor_row = UI_ACTION_ROW; /* 当前光标行（动作层经 Oled_UiGetCursorRow 读取） */
+static char s_last[UI_ROWS][UI_COLS + 1u];
+static uint8_t s_page = 0xFFu; /* 0xFF = 未绘制过（强制全刷） */
+static volatile uint32_t s_draw_ms; /* 最近一次绘制时刻（#ST disp 自检用） */
 
-/* 行名（调试日志用，ASCII） */
-static const char *const s_row_name[UI_ROWS] = {"CAN", "POS", "VEL", "T", "TEMP", "COUNT", "DIAG", "INFO"};
-
-static uint32_t now_ms(void)
+/* 画一行：格式化 → 补空格到 21 列 → 与上次比较 → 变化才写屏 */
+static void rfmt(uint8_t row, int force, const char *fmt, ...)
 {
-    return (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+    char tmp[64];
+    char out[UI_COLS + 1u];
+    va_list ap;
+    uint8_t n;
+    uint8_t i;
+
+    if (row >= UI_ROWS)
+        return;
+
+    va_start(ap, fmt);
+    (void)vsnprintf(tmp, sizeof(tmp), fmt, ap);
+    va_end(ap);
+
+    n = (uint8_t)strlen(tmp);
+    if (n > (uint8_t)UI_COLS)
+    {
+        n = (uint8_t)UI_COLS;
+    }
+    (void)memcpy(out, tmp, n);
+    for (i = n; i < (uint8_t)UI_COLS; i++)
+    {
+        out[i] = ' ';
+    }
+    out[UI_COLS] = '\0';
+
+    if ((force == 0) && (memcmp(out, s_last[row], UI_COLS) == 0))
+    {
+        return; /* 无变化：不刷 */
+    }
+    (void)memcpy(s_last[row], out, UI_COLS);
+    OLED_ShowString(0u, (uint8_t)(row * 8u), out, OLED_6X8);
 }
 
-/* 画一行：先写字，选中行再整行反色 */
-static void ui_row(uint8_t row, const char *txt, uint8_t selected)
+static const char *bus_state_str(uint8_t status)
 {
-    OLED_ShowString(0U, (uint8_t)(row * UI_ROW_H), txt, OLED_6X8);
-    if (selected != 0U)
+    switch (status)
     {
-        OLED_ReverseArea(0U, (uint8_t)(row * UI_ROW_H), 128U, UI_ROW_H);
+    case J8108_ST_INIT_FAIL:
+        return "INIT FAIL";
+    case J8108_ST_INIT_OK:
+        return "INIT OK WAIT";
+    case J8108_ST_READY:
+        return "READY";
+    case J8108_ST_BUS_ERR:
+        return "BUS ERR";
+    default:
+        return "?";
     }
 }
 
-static void oled_task(void *arg)
+void Oled_UiDraw(uint8_t page, const J8108_Snapshot_t *sn, const Ui_Status_t *ui)
 {
-    uint8_t cursor = UI_ACTION_ROW;
-    uint32_t hint_until_ms = 0U;
-    uint32_t hz_win_ms = now_ms();
-    uint32_t hz_win_cnt = 0U;
-    uint16_t fb_hz = 0U;
-    char line[24];
+    int force;
+    uint8_t have;
+    uint8_t fresh;
 
-    (void)arg;
+    if ((sn == NULL) || (ui == NULL))
+        return;
+    if (page >= UI_PAGE_COUNT)
+        page = 0u;
 
-    LOG_I("OledTask", "start: single-page monitor UI (8 rows x 21 cols, 6x8 font, ASCII only)");
-    LOG_I("OledTask", "row0 = CAN link state (INIT FAIL / INIT OK WAITING / READY / BUS ERR); no timer on screen by design");
+    s_draw_ms = HAL_GetTick(); /* 自检心跳（只写一个 volatile，无阻塞、不影响刷新逻辑） */
 
-    for (;;)
+    force = (page != s_page) ? 1 : 0;
+    if (force != 0)
     {
-        uint32_t t = now_ms();
-        J8108_Snapshot_t sn; /* M2：整屏取自"帧一致"快照，不直读驱动内部结构（避免与 200Hz 控制/中断撕数据） */
-        uint32_t rx;
-        uint32_t dt;
-        uint8_t have;
-
-        J8108_CopySnapshot(&sn);
-        rx = sn.rx_count;
-        dt = sn.frame_age_ms;
-        have = sn.valid;
-
-        /* ---- 1. 按键事件：光标移动（纯 UI，零副作用） ----
-           本任务只消费 CLICK/DOUBLE 两个位；HOLD_RELEASE/STUCK 位留给动作层(M3)，
-           提示行改用"最近事件时间"判定 → 两个任务不会互抢同一个事件位 */
-        if (Key_EventGroup() != NULL)
-        {
-            EventBits_t bits = xEventGroupWaitBits(Key_EventGroup(), KEY_BIT_CLICK | KEY_BIT_DOUBLE,
-                                                   pdTRUE, pdFALSE, 0);
-            uint32_t last_msg_ms = 0u;
-
-            if ((bits & KEY_BIT_CLICK) != 0U)
-            {
-                cursor = (uint8_t)((cursor + 1U) % UI_ROWS);
-                LOG_I("OledTask", "CLICK -> cursor row %u (%s)", cursor, s_row_name[cursor % UI_ROWS]);
-            }
-            if ((bits & KEY_BIT_DOUBLE) != 0U)
-            {
-                cursor = (uint8_t)((cursor + UI_ROWS - 1U) % UI_ROWS);
-                LOG_I("OledTask", "DOUBLE -> cursor row %u (%s)", cursor, s_row_name[cursor % UI_ROWS]);
-            }
-            Key_GetLastMsg(NULL, &last_msg_ms);
-            if (last_msg_ms != 0u)
-            {
-                hint_until_ms = last_msg_ms + UI_HINT_SHOW_MS;
-            }
-        }
-        s_cursor_row = cursor; /* 发布给动作层：长按作用于"光标选中行" */
-
-        /* ---- 2. 反馈帧率（1s 窗口） ---- */
-        if ((t - hz_win_ms) >= 1000U)
-        {
-            fb_hz = (uint16_t)(rx - hz_win_cnt);
-            hz_win_cnt = rx;
-            hz_win_ms = t;
-        }
-
+        s_page = page;
         OLED_Clear();
+        (void)memset(s_last, 0, sizeof(s_last)); /* 清空缓存 → 全刷 */
+        force = 1;
+    }
 
-        /* 行0：CAN 链路可视化（用户要求：初始化 OK / 通道就绪可发数据 / 失败上屏；失败不重试）
-           四态来自 motor_8108 的 J8108_Status_e（快照内） */
-        if (sn.status == (uint8_t)J8108_ST_INIT_FAIL)
+    have = sn->valid;
+    fresh = ((have != 0u) && (sn->frame_age_ms < 200u)) ? 1u : 0u;
+
+    switch (page)
+    {
+    /* ---------------------------------- P0 LINK ---------------------------------- */
+    case UI_PAGE_LINK:
+        rfmt(0u, force, "LINK %u/%u %s", (unsigned)(page + 1u), (unsigned)ui->page_cnt, bus_state_str(sn->status));
+
+        rfmt(1u, force, "RX %lu TX %lu", (unsigned long)sn->rx_count, (unsigned long)sn->tx_cnt);
+
+        if (sn->err == 0u)
         {
-            snprintf(line, sizeof(line), "CAN INIT FAIL");
-        }
-        else if (sn.status == (uint8_t)J8108_ST_BUS_ERR)
-        {
-            snprintf(line, sizeof(line), "CAN BUS ERR 0x%04lX", (unsigned long)(sn.bus_err & 0xFFFFu));
-        }
-        else if (sn.status == (uint8_t)J8108_ST_READY)
-        {
-            snprintf(line, sizeof(line), "CAN READY %4uHz %s", (unsigned)fb_hz, (J8108_IsHoldMode() != 0U) ? "HOLD" : "SEND");
-        }
-        else if (sn.status == (uint8_t)J8108_ST_INIT_OK)
-        {
-            snprintf(line, sizeof(line), "CAN INIT OK WAITING");
+            rfmt(2u, force, "ERR OK (%s)", J8108_ErrStr(sn->err));
         }
         else
         {
-            snprintf(line, sizeof(line), "CAN STATUS ?");
+            rfmt(2u, force, "ERR 0x%02X %s", sn->err, J8108_ErrStr(sn->err));
         }
-        ui_row(0U, line, (cursor == 0U));
 
-        /* 行1：位置（电机端 rad / 输出端 度） */
-        if (have == 0U)
-        {
-            snprintf(line, sizeof(line), "POS   ---.--r  -----");
-        }
-        else
-        {
-            snprintf(line, sizeof(line), "POS %7.2fr %5.1fd", (double)sn.pos, (double)sn.pos_out_deg);
-        }
-        ui_row(1U, line, (cursor == 1U));
-
-        /* 行2：速度（rad/s 输出端 / RPM） */
-        if (have == 0U)
-        {
-            snprintf(line, sizeof(line), "VEL   --.--r/s  ----");
-        }
-        else
-        {
-            snprintf(line, sizeof(line), "VEL %6.2fr/s %5.1fR", (double)sn.vel, (double)sn.vel_rpm);
-        }
-        ui_row(2U, line, (cursor == 2U));
-
-        /* 行3：前馈扭矩 */
-        if (have == 0U)
-        {
-            snprintf(line, sizeof(line), "T     --.---Nm");
-        }
-        else
-        {
-            snprintf(line, sizeof(line), "T %8.3fNm", (double)sn.torque);
-        }
-        ui_row(3U, line, (cursor == 3U));
-
-        /* 行4：两路温度（超温阈值 100℃ → 反色告警） */
-        if (have == 0U)
-        {
-            snprintf(line, sizeof(line), "MOS  --C COIL  --C");
-        }
-        else
-        {
-            snprintf(line, sizeof(line), "MOS %3.0fC COIL%3.0fC", (double)sn.t_mos, (double)sn.t_rotor);
-        }
-        ui_row(4U, line, (cursor == 4U) || (have != 0U && (sn.t_mos > 100.0f || sn.t_rotor > 100.0f)));
-
-        /* 行5：帧计数 */
-        snprintf(line, sizeof(line), "RX%7lu TX%6lu", (unsigned long)rx, (unsigned long)sn.tx_cnt);
-        ui_row(5U, line, (cursor == 5U));
-
-        /* ---- 行6：CAN 诊断。总线正常：距上一帧时间 + HAL 错误码；总线异常：TEC/REC/LEC（判"没人应答"）---- */
-        if (sn.bus_err != 0u)
+        if (sn->bus_err != 0u)
         {
             uint32_t esr = hcan1.Instance->ESR;
 
-            snprintf(line, sizeof(line), "TEC%3lu REC%3lu LEC%lu",
-                     (unsigned long)((esr & CAN_ESR_TEC) >> CAN_ESR_TEC_Pos),
-                     (unsigned long)((esr & CAN_ESR_REC) >> CAN_ESR_REC_Pos),
-                     (unsigned long)((esr & CAN_ESR_LEC) >> CAN_ESR_LEC_Pos));
+            rfmt(3u, force, "TEC%3lu REC%3lu LEC%lu",
+                 (unsigned long)((esr & CAN_ESR_TEC) >> CAN_ESR_TEC_Pos),
+                 (unsigned long)((esr & CAN_ESR_REC) >> CAN_ESR_REC_Pos),
+                 (unsigned long)((esr & CAN_ESR_LEC) >> CAN_ESR_LEC_Pos));
         }
         else
         {
-            snprintf(line, sizeof(line), "dT %4ums ES %04lX", (unsigned)dt, (unsigned long)(sn.bus_err & 0xFFFFu));
+            rfmt(3u, force, "BUS OK (HAL 0x%04lX)", (unsigned long)(sn->bus_err & 0xFFFFu));
         }
-        ui_row(6U, line, (cursor == 6U));
 
-        /* 行7：动作结果(2.5s) > 按键提示(2s) > 系统异常 > SD 异常 > 版本+运行时间 */
+        if (sn->rx_count == 0u)
         {
-            uint32_t act_age = 0u;
-            J8108_ActionResult_e ar = J8108_LastAction(&act_age);
-
-            if ((ar != ACTR_NONE) && (act_age < 2500u))
-            {
-                snprintf(line, sizeof(line), "%s", J8108_ActionResultStr(ar));
-            }
-            else if (t < hint_until_ms)
-            {
-                snprintf(line, sizeof(line), "CLK=v DBL=^ HOLD=EXEC");
-            }
-            else if (SYS_GetState() != SYS_STATE_RUNNING)
-            {
-                snprintf(line, sizeof(line), "SYS:%s", SYS_StateText(SYS_GetState()));
-            }
-            else if (g_rw_result > 0)
-            {
-                snprintf(line, sizeof(line), "SD: RW FAIL");
-            }
-            else
-            {
-                snprintf(line, sizeof(line), "%s UP%lus", FW_VERSION_STR, (unsigned long)(xTaskGetTickCount() / configTICK_RATE_HZ));
-            }
+            rfmt(4u, force, "AGE never  LINK DOWN"); /* 从未收到过反馈帧（不是"年龄 0ms"） */
         }
-        ui_row(7U, line, (cursor == 7U));
+        else if (fresh != 0u)
+        {
+            rfmt(4u, force, "AGE %lums  %uHz", (unsigned long)sn->frame_age_ms, (unsigned)ui->fb_hz);
+        }
+        else
+        {
+            rfmt(4u, force, "AGE %lums  LINK DOWN", (unsigned long)sn->frame_age_ms);
+        }
 
-        OLED_Update();
+        rfmt(5u, force, "MODE %s EN %u", Ctrl_ModeStr((Ctrl_Mode_e)ui->mode), (unsigned)ui->enabled);
+        rfmt(6u, force, "SET %8.2f %s", (double)ui->set_deg, "deg");
+        rfmt(7u, force, "KEY CLK=next DBL=prev");
+        break;
 
-        vTaskDelay(pdMS_TO_TICKS(OLED_REFRESH_PERIOD_MS));
+    /* --------------------------------- P1 MOTION --------------------------------- */
+    case UI_PAGE_MOTION:
+        rfmt(0u, force, "MOTION %u/%u %s", (unsigned)(page + 1u), (unsigned)ui->page_cnt,
+             Ctrl_ModeStr((Ctrl_Mode_e)ui->mode));
+
+        if (fresh != 0u)
+        {
+            rfmt(1u, force, "POS %9.2f deg", (double)sn->pos_deg);
+            rfmt(2u, force, "VEL %9.2f dps", (double)sn->vel_dps);
+            rfmt(3u, force, "T   %9.3f Nm", (double)sn->torque);
+            rfmt(6u, force, "Tm %4.1fC Tr %4.1fC", (double)sn->t_mos, (double)sn->t_rotor);
+        }
+        else
+        {
+            rfmt(1u, force, "POS      ---- deg");
+            rfmt(2u, force, "VEL      ---- dps");
+            rfmt(3u, force, "T        ---- Nm");
+            rfmt(6u, force, "Tm   --.-C Tr  --.-C");
+        }
+
+        switch ((Ctrl_Mode_e)ui->mode)
+        {
+        case CTRL_MODE_POS:
+            rfmt(4u, force, "SET %9.2f deg", (double)ui->set_deg);
+            break;
+        case CTRL_MODE_SPEED:
+            rfmt(4u, force, "SET %9.2f dps", (double)ui->set_dps);
+            break;
+        case CTRL_MODE_TORQUE:
+        case CTRL_MODE_IMP:
+            rfmt(4u, force, "SET %9.3f Nm", (double)ui->set_nm);
+            break;
+        default:
+            rfmt(4u, force, "SET      ---- ");
+            break;
+        }
+
+        rfmt(5u, force, "KP %5.1f KD %5.2f", (double)ui->kp_now, (double)ui->kd_now);
+        rfmt(7u, force, "EN %u SEND %u INPOS %u", (unsigned)ui->enabled, (unsigned)ui->frames_on, (unsigned)ui->inpos);
+        break;
+
+    /* --------------------------------- P2 SERIAL --------------------------------- */
+    case UI_PAGE_SERIAL:
+        rfmt(0u, force, "SERIAL %u/%u", (unsigned)(page + 1u), (unsigned)ui->page_cnt);
+        rfmt(1u, force, "LAST #%s", (ui->last_cmd[0] != '\0') ? ui->last_cmd : "-");
+        rfmt(2u, force, "RX %luL %luB TX %luL", (unsigned long)ui->rx_lines, (unsigned long)ui->rx_bytes,
+             (unsigned long)ui->tx_lines);
+        rfmt(3u, force, "WD LEFT %5ums", (unsigned)ui->wd_left_ms);
+        rfmt(4u, force, "MOTOR ERR 0x%02X", sn->err);
+        if (ui->err_code == 0u)
+        {
+            rfmt(5u, force, "PROTO ERR 0 (none)");
+        }
+        else
+        {
+            rfmt(5u, force, "PROTO ERR %u", (unsigned)ui->err_code);
+        }
+        if (ui->tel_period_ms == 0u)
+        {
+            rfmt(6u, force, "TEL off");
+        }
+        else
+        {
+            rfmt(6u, force, "TEL %ums", (unsigned)ui->tel_period_ms);
+        }
+        rfmt(7u, force, "#EN #V #P #STOP");
+        break;
+
+    /* --------------------------------- P3 SYSTEM --------------------------------- */
+    default:
+        rfmt(0u, force, "SYSTEM %u/%u UP %lus", (unsigned)(page + 1u), (unsigned)ui->page_cnt, (unsigned long)ui->uptime_s);
+        rfmt(1u, force, "FW %s", FW_VERSION_STR);
+        rfmt(2u, force, "PROTO v1 %s", "serial");
+        rfmt(3u, force, "HEAP %lu B", (unsigned long)ui->free_heap);
+        rfmt(4u, force, "TASKS %lu", (unsigned long)ui->task_cnt);
+        rfmt(5u, force, "EV 0x%04lX", (unsigned long)(ui->ev_flags & 0xFFFFu));
+        rfmt(6u, force, "PMAX %.0f deg", (double)(J8108_P_HI * J8108_RAD2DEG));
+        rfmt(7u, force, "KEY: UI ONLY (no motor)");
+        break;
     }
+
+    OLED_Update(); /* 变更行已写入显存；此处统一提交（无变化时也只是一次空转 I2C 命令） */
 }
 
-void Oled_Task_Init(void)
+uint8_t Oled_SelfTest(void)
 {
-    BaseType_t ok = xTaskCreate(oled_task, "OledTask", OLED_TASK_STACK_WORDS, NULL, OLED_TASK_PRIORITY, &s_oled_task);
+    uint32_t age;
 
-    if (ok != pdPASS)
-    {
-        LOG_E("OledTask", "xTaskCreate FAILED (heap/stack?) -> UI DISABLED");
-    }
+    if (s_draw_ms == 0u)
+        return 2u; /* 还没画过一帧：Monitor 可能没起来 */
+    age = HAL_GetTick() - s_draw_ms;
+    return (age < 2000u) ? 1u : 2u; /* 2s 没刷新 → 可疑（屏/监视任务停了） */
 }
 
-uint8_t Oled_UiGetCursorRow(void)
-{
-    return s_cursor_row;
-}
+#endif /* FEATURE_DISP_UI */

@@ -14,6 +14,10 @@
 #include "string.h"
 #include "feature_config.h"
 
+#if FEATURE_KEY
+/* M3 文件级隔离（docs/规范_功能宏与模块化.md R3）：未启用时本文件编译为空对象。
+ * 被谁调用必须由调用点用同一个宏保护（忘保护=链接失败，这是刻意设计的 fail-fast）。 */
+
 static KeyCore_t s_core;
 static EventGroupHandle_t s_evt_group = NULL;
 static TaskHandle_t s_key_task = NULL;
@@ -208,3 +212,15 @@ void Key_GetLastMsg(KeyCore_Msg_t *out, uint32_t *ms)
         *ms = s_last_msg_ms;
     }
 }
+
+uint8_t Key_SelfTest(void)
+{
+    /* 非破坏性：只读状态，不消费事件位、不改配置 */
+    if (Key_EventGroup() == NULL)
+        return 3u; /* 事件组没建 → 驱动/任务没起来 */
+    if ((Key_IsPressed() != 0u) && (Key_GetHoldMs() >= (uint32_t)KEYC_STUCK_MS))
+        return 2u; /* 一直按住不放：按键卡住或接线短路（UI 会一直收到长按） */
+    return 1u;
+}
+
+#endif /* FEATURE_KEY */

@@ -21,6 +21,9 @@
 /   869   Greek 2
 */
 
+#include "feature_config.h"   /* M3 文件级隔离开关（FatFs 只在 SD 功能打开时才需要） */
+
+#if FEATURE_SD_CARD
 #include "../ff.h"
 
 
@@ -386,3 +389,4 @@ WCHAR ff_wtoupper (	/* Returns upper converted character */
 	return chr;
 }
 
+#endif /* FEATURE_SD_CARD */

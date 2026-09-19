@@ -18,6 +18,9 @@
 /----------------------------------------------------------------------------*/
 
 
+#include "feature_config.h"   /* M3 文件级隔离开关（FatFs 只在 SD 功能打开时才需要） */
+
+#if FEATURE_SD_CARD
 #include "ff.h"			/* Declarations of FatFs API */
 #include "diskio.h"		/* Declarations of device I/O functions */
 
@@ -6138,3 +6141,5 @@ int f_printf (
 
 #endif /* !_FS_READONLY */
 #endif /* _USE_STRFUNC */
+
+#endif /* FEATURE_SD_CARD */
