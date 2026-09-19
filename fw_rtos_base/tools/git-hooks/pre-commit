@@ -1,0 +1,8 @@
+#!/bin/sh
+# 门禁钩子：提交前跑秒级检查（宿主逻辑测试 + 静态断言 + 组合语法扫描）
+# 紧急绕过：git commit --no-verify
+cd "$(git rev-parse --show-toplevel)" || exit 1
+PYTHONPATH= python fw_rtos_base/tools/verify_dev.py --fast || {
+  echo ''; echo '[pre-commit] 门禁未通过 — 提交已中止（紧急绕过用 git commit --no-verify）'; exit 1; }
+python fw_rtos_base/tools/check_profiles.py --fast >/dev/null || {
+  echo '[pre-commit] 组合编译门禁未通过 — 提交已中止'; exit 1; }

@@ -618,6 +618,54 @@ def static_checks():
             _zombie.append(f"{_f}({_n})")
     check(f"V9: {len(_feat)} 个 FEATURE_* 都至少被 2 处使用（防僵尸宏，豁免已登记）",
           not _zombie, ",".join(_zombie))
+    # ---- Q2：函数长度门禁（>=120 行 FAIL / >=80 行 WARN）+ 棘轮（存量豁免只许降不许升）----
+    # 为什么这么定：长函数没法被穷举测试（本工程能自动测的全是小函数）。棘轮 = 不许新增违规，
+    # 也不搞大爆炸重构：存量逐条登记，谁下次动它谁顺手拆。
+    def _func_lens(root):
+        out = []
+        for _dp, _, _fns in os.walk(os.path.join(BASE, root)):
+            for _fn in _fns:
+                if not _fn.endswith(".c"):
+                    continue
+                _p = os.path.join(_dp, _fn)
+                _ls = open(_p, encoding="utf-8", errors="replace").read().splitlines()
+                _st = None
+                for _i, _l in enumerate(_ls):
+                    if _st is None:
+                        if (re.match(r"^[A-Za-z_][\w \*]*\([^;]*\)\s*$", _l)
+                                and not _l.lstrip().startswith(("if", "for", "while", "switch", "return"))):
+                            _st = _i
+                    elif _l.startswith("}"):
+                        out.append((_i - _st + 1, os.path.relpath(_p, BASE).replace("\\", "/"), _st + 1))
+                        _st = None
+        return out
+
+    # 厂商标例：不参与本门禁（system_* 是 CubeMX 生成；OLED.c 是屏厂例程，彩屏 S1 会整体替换）
+    _Q2_VENDOR = ("Core/Src/system_stm32f4xx.c", "mcu_bsp/oled/OLED.c")
+    # 棘轮基线（2026-09-19 实测行号:行数）—— 只许降不许升；每条写明"何时拆"
+    _Q2_BASE = {
+        "Task/Src/CmdRx_Task.c": {452: 479},  # dispatch() 命令分派表：纯线性表，拆它收益小风险大
+        "Core/Src/main.c": {111: 196},        # main() 组装根：初始化顺序本身就是它的职责
+        "Task/Src/Oled_Task.c": {94: 157},    # Oled_UiDraw()：彩屏 S3 抽绘制原语时一并拆
+        "mcu_bsp/key/key_core.c": {17: 151},  # KeyCore_Step() 手势状态机：纯逻辑，已被宿主测试穷举
+    }
+    _over120, _grew, _warn80 = [], [], 0
+    for _n, _rel, _ln in _func_lens("Task/Src") + _func_lens("mcu_bsp") + _func_lens("Core/Src"):
+        if _rel in _Q2_VENDOR:
+            continue
+        _base = _Q2_BASE.get(_rel, {}).get(_ln)
+        if _base is not None:
+            if _n > _base:
+                _grew.append(f"{_rel}:{_ln} {_n}>{_base}")
+            continue
+        if _n >= 120:
+            _over120.append(f"{_rel}:{_ln}({_n})")
+        elif _n >= 80:
+            _warn80 += 1
+    check("Q2: 无超过 120 行的函数（棘轮：4 个存量豁免只许降不许升）",
+          not _over120 and not _grew,
+          "新增超线:" + ",".join(_over120) + " 豁免变长:" + ",".join(_grew))
+    print(f"        提示: {_warn80} 个函数落在 80~119 行（警告线，不阻塞；下次动它们时优先拆）")
 
     bad = []
     for rel in ("mcu_bsp/key/bsp_key.c", "Task/Src/J8108_Task.c", "Task/Src/Oled_Task.c", "mcu_bsp/Motor/motor_8108.c"):
